@@ -198,19 +198,75 @@ export function fullSyncQuestion(reason: FullSyncReason | undefined, machine: st
 // it again rather than ask twice.
 export const FULL_SYNC_ASK_TITLE = 'Show tool output on your other devices?';
 
+// The card's two options. The runner sets the answer itself when Mike picks
+// one on the card (fullSyncAnswer), not the asking thread's agent: an agent
+// is only told the answer as text, and another thread could send it the
+// same words (Daybreak 121, 13 Nov 2026).
+export const FULL_SYNC_ON = 'Turn it on';
+export const FULL_SYNC_OFF = 'Leave it off';
+
+// What each option says it does, on the card. The pick counts only on the
+// card as the runner worded it (fullSyncAnswer).
+export const FULL_SYNC_ON_DOES = 'Tool output, input and diffs go up too, scrubbed, kept 30 days';
+export const FULL_SYNC_OFF_DOES = 'Only messages and a line per tool, as now';
+
+type CardAsk = { action: string; options?: string[]; optionNotes?: string[]; why?: string; where?: unknown; reply?: string; links?: unknown[]; run?: unknown };
+
+/**
+ * What Mike picked on the asking thread's open card, or undefined. Only a
+ * message's `answers` count, which come from the app, the phone or the
+ * website (an agent's are taken out, rpc-gate.ts), and only for the ask the
+ * runner worded: its question as the runner noted it, the two options with
+ * what they do, and nothing else on it. The agent writes the card, so
+ * another thread could talk it into the same two options under another
+ * question ("Turn on local logging?"), and his pick would have answered
+ * that (Codex's review). Any other card sets nothing.
+ */
+export function fullSyncAnswer(answers: { action: string; answer: string }[] | undefined, card: CardAsk[] | undefined, question: string | undefined): boolean | undefined {
+  // One ask on the card, so a second with the same words but other notes
+  // can't take his pick (answers name an ask by its words; Codex's review).
+  if (!question || card?.length !== 1) return undefined;
+  const ask = card.find(
+    (a) =>
+      a.action === question &&
+      a.options?.length === 2 &&
+      a.options[0] === FULL_SYNC_ON &&
+      a.options[1] === FULL_SYNC_OFF &&
+      (a.optionNotes === undefined || (a.optionNotes.length === 2 && a.optionNotes[0] === FULL_SYNC_ON_DOES && a.optionNotes[1] === FULL_SYNC_OFF_DOES)) &&
+      !a.why &&
+      !a.where &&
+      !a.reply &&
+      !a.links?.length &&
+      // A card's command from Run on the card (taken out 14 Nov 2026) can still be in an old record.
+      !('run' in a),
+  );
+  const picked = ask && answers?.find((a) => a.action === ask.action)?.answer;
+  return picked === FULL_SYNC_ON ? true : picked === FULL_SYNC_OFF ? false : undefined;
+}
+
+/** Runner's `answered`: Mike's pick on the asking thread's card sets full sync, once (settings.update forgets the thread). */
+export function fullSyncAnswerer(o: { asked: () => { thread?: string; question?: string } | undefined; set: (on: boolean) => void }) {
+  return (threadId: string, answers: { action: string; answer: string }[], card: CardAsk[] | undefined): void => {
+    const asked = o.asked();
+    if (!asked?.thread || threadId !== asked.thread) return;
+    const on = fullSyncAnswer(answers, card, asked.question);
+    if (on !== undefined) o.set(on);
+  };
+}
+
 export function askBrief(tb: string, reason?: FullSyncReason, machine = 'Mac'): { title: string; why: string; text: string } {
   const question = fullSyncQuestion(reason, machine);
   return {
     title: FULL_SYNC_ASK_TITLE,
     why: 'asks once about full sync',
     text: [
-      "You're starting this on the runner's behalf (docs/full-convex.md step 6). Ask the user one question, then set the answer. Don't do anything else.",
+      "You're starting this on the runner's behalf (docs/full-convex.md step 6). Ask the user one question. Don't do anything else.",
       '',
-      `End your turn at once with end_turn: needs "you", one ask, the question "${question}", options "Turn it on" (does: "Tool output, input and diffs go up too, scrubbed, kept 30 days") and "Leave it off" (does: "Only messages and a line per tool, as now"), suggested none.`,
+      `End your turn at once with end_turn: needs "you", one ask, the question "${question}", options "${FULL_SYNC_ON}" (does: "${FULL_SYNC_ON_DOES}") and "${FULL_SYNC_OFF}" (does: "${FULL_SYNC_OFF_DOES}"), suggested none, and nothing else on the ask (no why, where, reply or links). Word the question exactly so: the runner reads the pick only from that card.`,
       `Your reply, in plain words and short: with this on, the phone, the website and other machines can open a thread's tool output and diffs, not just its messages and a line per tool, even when this ${machine} isn't there to ask. They go to the user's own Convex deployment, kept 30 days, with secrets scrubbed out first, but that isn't a guarantee; screenshots and files that hold secrets stay on this ${machine}.`,
       '',
-      `When they answer: for "Turn it on", run \`${tb} settings full on\`; for "Leave it off", run \`${tb} settings full off\`. Say in one line what you set and that it takes effect when the runner next starts, then end_turn with needs "nothing" and archive true.`,
-      "If they write something else, answer it briefly and ask again. If they never answer, nothing changes: it stays off and this isn't asked again.",
+      `Picking an option on the card sets it: the runner does that itself, and you can't (don't run \`${tb} settings\`). When they've picked one, say in one line which they picked and that it takes effect when the runner next starts, then end_turn with needs "nothing" and archive true.`,
+      `If they write something else, answer it briefly and ask again with the same card: only a pick on it counts. If they never answer, nothing changes: it stays off and this isn't asked again.`,
     ].join('\n'),
   };
 }

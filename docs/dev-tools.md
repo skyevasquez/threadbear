@@ -127,15 +127,26 @@ the data dir (`<home>`, normally `~/Library/Application Support/Threadbear`):
   one `swiftc`, signed like the Mac app) only when it's missing or
   `runner/launcher/` changed since, so a launcher change ships by running
   `install-runner.sh` again, which only Mike can do for the real runner;
-  releases and Node updates never touch it. The runner can't reinstall
-  the launchd job it runs in, so when it follows main it says instead:
-  each check compares main's `launch.mjs` with the installed one, and
-  main's `runner/launcher/` hash with the app's `build.json` (the app named
-  by `THREADBEAR_RUNNER_APP` in the plist, else the process above
+  releases and Node updates never touch it. When it follows main, each
+  check compares main's `launch.mjs` with the installed one, and main's
+  `runner/launcher/` hash with the app's `build.json` (the app named by
+  `THREADBEAR_RUNNER_APP` in the plist, else the process above
   launch.mjs), and a runner with neither still runs node as the program.
   Any of those sets `launcherChanged` and `launcherReason`, which
-  `tb status` and the app's Updates panel show with the command
-  (`launchAgentBehind` in `src/update.ts`). `--uninstall` leaves the app
+  `tb status` and the app's Updates panel show (`launchAgentBehind` in
+  `src/update.ts`). The Updates panel's Reinstall now (`runner.reinstall`)
+  has the runner run `install-runner.sh` itself, or it does so by itself
+  with the `selfReinstall` experiment (`src/reinstall.ts`). Stopping the
+  runner's job stops its whole process group, so the script runs as a
+  launchd job of its own, `<label>.reinstall`, from a one-shot plist in
+  `<home>/runner/reinstall/` (a transient `systemd-run --user` unit on
+  Linux), from the checkout the release was built from, once no thread is
+  busy. Its output goes to `<home>/runner/reinstall.log` and its exit code
+  to `<home>/runner/reinstall/result`, read by whichever runner is up then.
+  `install-runner.sh` exits 75 when threads are busy (it asks again right
+  before it stops anything, as building can take minutes), which the
+  runner takes as "wait and try again", not a failure. A failed reinstall
+  isn't tried again by itself until main's launcher changes. `--uninstall` leaves the app
   where it is. `--from-source` keeps today's run-from-the-checkout mode for
   debugging. `--home`, `--label` and `--port` allow a sandbox install next
   to the real one (the plist then sets `THREADBEAR_HOME` and
@@ -232,6 +243,16 @@ the data dir (`<home>`, normally `~/Library/Application Support/Threadbear`):
   adds the runner's real-model e2e (cheapest model, temp dirs); `--shots`
   runs `app/Tools/screenshots.sh`. One line per step, nonzero exit if
   anything failed, on the Node `runner/scripts/find-node.sh` picks.
+  Unit tests preload `runner/test/helpers/clean-env.ts`: each process gets
+  a temporary HOME and XDG folders, and inherited account/data overrides
+  are cleared. `private-home.ts` rejects reads of real Claude, Codex,
+  Cursor, OpenCode, Token Stats and Threadbear account/data folders,
+  including through symlinks; a caught read error still fails the file.
+  The original home paths stay guarded in child test processes after
+  HOME has been replaced, including for a uid without a passwd entry.
+  The shared fake-runner helpers also load this setup for single-file
+  `node --test` runs. Discovery fixtures supply their own `userHome` and
+  `pathEnv`, so installed CLIs on the check host cannot add accounts.
 
 ### 5. Docs
 

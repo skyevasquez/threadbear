@@ -754,7 +754,7 @@ impl SidePane {
         }
         if let Some(app) = self.app.upgrade() {
             app.update(cx, |t, cx| {
-                if let Some(ask) = t.threads.get_mut(&thread_id).and_then(|t| t.asks.as_mut()).and_then(|a| a.get_mut(index)) {
+                if let Some(ask) = t.threads.get_mut(&thread_id).map(std::sync::Arc::make_mut).and_then(|t| t.asks.as_mut()).and_then(|a| a.get_mut(index)) {
                     ask.ticked = Some(ticked);
                 }
                 cx.notify();
@@ -769,7 +769,7 @@ impl SidePane {
                 if let Err(e) = res {
                     if let Some(app) = t.app.upgrade() {
                         app.update(cx, |app, cx| {
-                            if let Some(ask) = app.threads.get_mut(&thread_id).and_then(|t| t.asks.as_mut()).and_then(|a| a.get_mut(index)) {
+                            if let Some(ask) = app.threads.get_mut(&thread_id).map(std::sync::Arc::make_mut).and_then(|t| t.asks.as_mut()).and_then(|a| a.get_mut(index)) {
                                 ask.ticked = Some(!ticked);
                             }
                             cx.notify();
@@ -1002,7 +1002,7 @@ pub(crate) fn tipped(el: Stateful<Div>, tip: impl Into<SharedString>) -> gpui_ki
 pub(crate) fn tipped_as(el: Stateful<Div>, tip: impl Into<SharedString>, role: Role) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
     let text: SharedString = tip.into();
     let shown = text.clone();
-    el.test_support().role(role).aria_label(text).tip(shown)
+    crate::a11y::A11yRole::a11y_role(el.test_support(), role).aria_label(text).tip(shown)
 }
 
 /// One row in the pane's lists (`PaneRow`): a grey icon, the title with a word
@@ -1177,7 +1177,12 @@ impl PaneRow {
             wrapper = wrapper.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| (click)(this, window, cx)));
         }
         if let Some(menu) = self.on_menu {
-            wrapper = wrapper.on_mouse_down(MouseButton::Right, cx.listener(move |this, ev: &MouseDownEvent, window, cx| (menu)(this, ev.position, window, cx)));
+            wrapper = wrapper.on_mouse_down(MouseButton::Right, cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                // A row's own menu takes the press before the dock's panel
+                // menu sees it. This covers links, files, pins and schedules.
+                cx.stop_propagation();
+                (menu)(this, ev.position, window, cx);
+            }));
         }
         crate::file_drag::FileDragExt::file_drag(wrapper, self.drag)
     }
@@ -1309,7 +1314,7 @@ impl SidePane {
         let clock = side::local_now();
         let now = now_ms();
         let started = match self.app.upgrade() {
-            Some(app) => core::started_rows(thread, app.read(cx).threads.values(), now),
+            Some(app) => core::started_rows(thread, app.read(cx).threads.values().map(|t| &**t), now),
             None => vec![],
         };
         let subagents = core::subagents_for_highlights(thread);
@@ -1889,7 +1894,7 @@ impl SidePane {
         let (clock, now) = (side::local_now(), now_ms());
         let app = self.app.upgrade();
         let started = match &app {
-            Some(app) => core::started_rows(thread, app.read(cx).threads.values(), now),
+            Some(app) => core::started_rows(thread, app.read(cx).threads.values().map(|t| &**t), now),
             None => vec![],
         };
         let subagents = core::subagents_for_highlights(thread);

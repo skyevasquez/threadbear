@@ -50,6 +50,8 @@ impl SidebarView {
 
 impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Its rows place their turning arcs afresh as they paint (spinner.rs).
+        crate::spinner::view_drawing(window);
         let Some(app) = self.app.upgrade() else { return div().into_any_element() };
         let focus = app.read(cx).sidebar.focus.clone();
         let content = app.update(cx, |t, cx| t.render_threads_panel(window, cx));
@@ -356,6 +358,8 @@ pub(crate) struct SidebarState {
     pub(crate) reveal: crate::row_motion::Reveal,
     /// Where the rows were and where they're going (row_motion.rs).
     pub(crate) motion: std::rc::Rc<crate::row_motion::RowMotion>,
+    /// Rows far out of view, drawn as gaps while the list scrolls (far_rows.rs).
+    pub(crate) far: std::rc::Rc<crate::far_rows::FarRows>,
     /// A row swiped or dragged with the mouse (row_swipe.rs).
     pub(crate) gestures: crate::row_swipe::RowGestures,
     /// Where the Inbox's sort button was last drawn, for its menu to hang
@@ -386,7 +390,7 @@ impl SidebarState {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 n = n.wrapping_add(1);
                 let alive = this.update(cx, |t, cx| {
-                    let ticking = t.threads.values().any(|t| t.busy() || t.subagents.iter().flatten().any(|s| s.get("status").and_then(Value::as_str) == Some("running")));
+                    let ticking = t.threads.values().map(|t| &**t).any(|t| t.busy() || t.subagents.iter().flatten().any(|s| s.get("status").and_then(Value::as_str) == Some("running")));
                     let twentieth = n.is_multiple_of(20);
                     if twentieth || ticking {
                         cx.notify();
@@ -421,6 +425,7 @@ impl SidebarState {
             focus: cx.focus_handle(),
             reveal: Default::default(),
             motion: Default::default(),
+            far: Default::default(),
             gestures: Default::default(),
             sort_button: Default::default(),
             _tick: tick,
@@ -514,7 +519,7 @@ macro_rules! tipped {
     ($el:expr, $id:expr, $tip:expr, $role:expr) => {{
         let tip_text: SharedString = $tip.into();
         let shown = tip_text.clone();
-        crate::tips::Tip::tip($el.id($id).test_support().role($role).aria_label(tip_text), shown)
+        crate::tips::Tip::tip(crate::a11y::A11yRole::a11y_role($el.id($id).test_support(), $role).aria_label(tip_text), shown)
     }};
 }
 pub(crate) use tipped;
@@ -536,7 +541,7 @@ impl Threadbear {
     /// thread.updated) puts it right or rolls it back.
     pub(crate) fn update_thread(&mut self, id: &str, change: impl FnOnce(&mut ThreadSummary), params: Value, cx: &mut Context<Self>) {
         let before = self.threads.get(id).cloned();
-        if let Some(t) = self.threads.get_mut(id) {
+        if let Some(t) = self.threads.get_mut(id).map(std::sync::Arc::make_mut) {
             change(t);
         }
         let guess = self.threads.get(id).cloned();
@@ -550,7 +555,7 @@ impl Threadbear {
             this.update(cx, |this, cx| {
                 if let Err(e) = res {
                     this.show_error(e.message, cx);
-                    threadbear_core::inbox::roll_back(&mut this.threads, before, guess.as_ref());
+                    threadbear_core::inbox::roll_back(&mut *this.threads, before, guess.as_deref());
                 }
                 cx.notify();
             })
@@ -720,7 +725,7 @@ impl Threadbear {
         let next = self.neighbour_of(&id, cx, now_ms());
         self.launch_flight(&id, crate::archive_flight::Destination::Hibernate, cx);
         let before = self.threads.get(&id).cloned();
-        if let Some(t) = self.threads.get_mut(&id) {
+        if let Some(t) = self.threads.get_mut(&id).map(std::sync::Arc::make_mut) {
             t.snoozed_until = Some("9999-12-31T00:00:00.000Z".into());
             t.snoozed_until_restart = None;
             t.wake_when = Some(json!({ "said": said, "pending": true }));
@@ -734,7 +739,7 @@ impl Threadbear {
             this.update(cx, |this, cx| {
                 if let Err(e) = res {
                     this.show_error(e.message, cx);
-                    threadbear_core::inbox::roll_back(&mut this.threads, before, guess.as_ref());
+                    threadbear_core::inbox::roll_back(&mut *this.threads, before, guess.as_deref());
                 }
                 cx.notify();
             })
@@ -1121,11 +1126,13 @@ impl Threadbear {
         // Rows glide to their new place as the list changes (row_motion.rs):
         // what's drawn, top to bottom, and what a fold is moving already.
         let motion = self.sidebar.motion.clone();
+        let far = self.sidebar.far.clone();
+        far.begin(self.sidebar_view.as_ref().map(|v| v.entity_id()), &self.sidebar.scroll);
         let (mut drawn, mut quiet) = (Vec::<String>::new(), HashSet::<String>::new());
         // The selected row's highlight slides to it from the last one.
         let open_row = self.selected.as_deref().filter(|_| self.home_page().is_none() && self.projects.open.is_none());
         self.sidebar.selection_sliding = motion.selection(open_row, cx.reduce_motion());
-        let mut list = v_flex().px(px(OUTER_INSET)).pb(px(32.)).child(motion.list_marker()).child(motion.selection_marker(p.selected, CORNER));
+        let mut list = v_flex().px(px(OUTER_INSET)).pb(px(32.)).child(motion.list_marker()).child(motion.selection_marker(p.selected, CORNER)).child(far.marker());
         let loaded = self.sidebar.loaded;
         if !loaded {
             list = list.child(render_loading_rows(&p));
@@ -1169,13 +1176,24 @@ impl Threadbear {
                 };
                 for t in section.rows.iter().take(shown.0) {
                     let wake = (section.key == "hibernating").then(|| wakes.get(&t.id)).flatten();
-                    let mut row = self.render_row(t, section.key, wake, now, &clock, &p, cx);
-                    // The open row closes up as its page flies, lifting the
-                    // heading below it, which the flight allows for.
-                    if self.selected.as_ref() == Some(&t.id) {
-                        row = div().relative().child(row).child(crate::archive_flight::mark(crate::archive_flight::Mark::OpenRow)).into_any_element();
-                    }
-                    body = place(t.id.clone(), row, body);
+                    let selected = self.selected.as_ref() == Some(&t.id);
+                    // Far out of view it's a gap its height (far_rows.rs),
+                    // unless it's the open row, which a flight starts from,
+                    // or one the pointer or a menu is on.
+                    let keep = selected || self.sidebar.hovered.as_deref() == Some(t.id.as_str()) || self.sidebar.menu.as_ref().is_some_and(|m| m.thread.as_deref() == Some(t.id.as_str()));
+                    let gap = if keep { None } else { far.far(&t.id) };
+                    let row = gap.is_none().then(|| {
+                        let row = self.render_row(t, section.key, wake, now, &clock, &p, cx);
+                        // The open row closes up as its page flies, lifting the
+                        // heading below it, which the flight allows for.
+                        if selected {
+                            div().relative().child(row).child(crate::archive_flight::mark(crate::archive_flight::Mark::OpenRow)).into_any_element()
+                        } else {
+                            row
+                        }
+                    });
+                    body = place(t.id.clone(), far.row(&t.id, row, gap.unwrap_or(0.)), body);
+                    // Its sub-agents' rows (a few, and rare) are always built.
                     if !matches!(section.key, "hibernating" | "archived") {
                         for (i, sub) in self.render_subagents(t, section.key, now, &p, cx).into_iter().enumerate() {
                             body = place(format!("sub:{}:{i}", t.id), sub, body);
@@ -1532,7 +1550,7 @@ impl Threadbear {
             .text_color(fg)
             .when(look.emphasised, |s| s.font_semibold())
             // Fades over to a new name, as the agent names a new thread (open_motion.rs).
-            .child(crate::open_motion::title(&format!("row-{}-{section}", t.id), title.into(), cx.reduce_motion()));
+            .child(crate::open_motion::title(&t.id, &format!("row-{section}"), title.into(), cx.reduce_motion()));
 
         let second_line = h_flex()
             .items_baseline()
@@ -1899,7 +1917,7 @@ fn render_trailing(trailing: &rows::Trailing, id: String, p: &Palette) -> AnyEle
             .text_size(meta).line_height(px(15.))
             .font_medium()
             .text_color(p.accent)
-            .child(crate::spinner::TurningArc::new(12., p.accent))
+            .child(crate::spinner::TurningArc::new(12., p.accent).layered())
             .child(text)
             .into_any_element(),
         TrailingKind::Background => h_flex()
@@ -1909,7 +1927,7 @@ fn render_trailing(trailing: &rows::Trailing, id: String, p: &Palette) -> AnyEle
             .text_size(meta).line_height(px(15.))
             .font_medium()
             .text_color(p.secondary)
-            .child(crate::spinner::TurningArc::new(12., p.secondary))
+            .child(crate::spinner::TurningArc::new(12., p.secondary).layered())
             .child(text)
             .into_any_element(),
         TrailingKind::Failed => gives_way(div()).text_size(meta).line_height(px(15.)).font_medium().text_color(p.failed).child(text).into_any_element(),
@@ -1956,7 +1974,7 @@ fn render_subagent_row(t: &ThreadSummary, row: &rows::SubagentRow, first: bool, 
     let (guide, secondary, faint, fg, failed) = (p.guide, p.secondary, p.faint, p.fg, p.failed);
     let running = sub.running();
     let glyph: AnyElement = match sub.status.as_str() {
-        "running" => crate::spinner::TurningArc::new(11., secondary).into_any_element(),
+        "running" => crate::spinner::TurningArc::new(11., secondary).layered().into_any_element(),
         "completed" => icon("checkmark", 9., faint).into_any_element(),
         "failed" => icon("xmark", 9., failed).into_any_element(),
         _ => icon("minus", 9., faint).into_any_element(),

@@ -7,6 +7,7 @@
 // U+FFFC mark per chip, the chip drawn by the renderer below, and the input
 // keeps them atomic through edits and undo. That mark is exactly what the
 // Swift draft holds (InlinePictures), so the two apps' drafts read the same.
+use crate::a11y::A11yRole as _;
 use crate::app::Threadbear;
 use crate::composer_card::CardState;
 use crate::composer_chips::ModelPickerView;
@@ -347,7 +348,7 @@ impl Composer {
                 let (app_c, id) = (self.app.clone(), thread.id.clone());
                 let carry_on = advice.carry_on;
                 row = row.child(
-                    div().id("limit-switch").test_support().role(Role::GenericContainer).aria_label(tip).child(Button::new("limit-switch-button").label("Continue now on").small().secondary().tooltip(tip).on_click(move |_, _, cx| {
+                    div().id("limit-switch").test_support().a11y_role(Role::GenericContainer).aria_label(tip).child(Button::new("limit-switch-button").label("Continue now on").small().secondary().tooltip(tip).on_click(move |_, _, cx| {
                         app_c.update(cx, |a, cx| a.continue_now_on(&id, account.clone(), carry_on, cx)).ok();
                     })),
                 );
@@ -387,7 +388,7 @@ impl Composer {
                     }
                     menu
                 });
-                row = row.child(h_flex().gap(px(6.)).items_center().child(div().text_color(secondary).child("Carry on by itself")).child(div().id("limit-carry-on").test_support().role(Role::GenericContainer).aria_label(tip).child(menu)));
+                row = row.child(h_flex().gap(px(6.)).items_center().child(div().text_color(secondary).child("Carry on by itself")).child(div().id("limit-carry-on").test_support().a11y_role(Role::GenericContainer).aria_label(tip).child(menu)));
             }
             column = column.child(row);
         }
@@ -424,6 +425,12 @@ impl Composer {
 
     /// Whether the box holds anything a restart would lose: words, or a
     /// picture, one still being copied in included (app_update.rs).
+    /// A picture still being copied in: not in the draft yet (`draft`), so a
+    /// handover waits for it rather than lose it.
+    pub(crate) fn copying_picture(&self, cx: &App) -> bool {
+        self.box_chips(cx).iter().any(|(_, chip)| matches!(chip, threadbear_core::inline_chips::BoxChip::Picture(None)))
+    }
+
     pub(crate) fn holds_anything(&self, cx: &App) -> bool {
         let text = self.input.read(cx).value().to_string();
         threadbear_core::inline_chips::holds_anything(&text, &self.box_chips(cx))
@@ -688,6 +695,8 @@ impl Composer {
         if text.is_empty() && images.is_empty() {
             return;
         }
+        // The runner it's shown on, as a send says it (thread.rs, Daybreak 113).
+        let Some(runner_id) = self.app.upgrade().and_then(|app| app.read(cx).threads.get(&thread_id).map(|t| t.runner_id.clone())) else { return };
         if let Some(edit) = self.editing.as_mut() {
             edit.sending = true;
         }
@@ -698,7 +707,7 @@ impl Composer {
         cx.spawn(async move |this, cx| {
             let mut stop_background = false;
             loop {
-                let mut params = json!({ "threadId": thread_id, "seq": seq, "text": text, "stopBackground": stop_background });
+                let mut params = json!({ "threadId": thread_id, "seq": seq, "text": text, "stopBackground": stop_background, "runnerId": runner_id });
                 if !images_json.is_empty() {
                     params["images"] = json!(images_json);
                 }

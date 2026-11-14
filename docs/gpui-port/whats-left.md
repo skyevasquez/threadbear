@@ -20,8 +20,8 @@ you go.
 - [x] Projects: the Projects page and sidebar view, a project's page, its
   decisions, Projects ▸ in the row and ... menus, the header's project tiles
   opening the page, New Thread in a project (`projects.*`, `header.projectchip`)
-- [x] The Terminal: ⌘J with a shell per thread, Run on an ask with a command,
-  the play icon on a reply's shell block (`terminal.*`, `cards.run`)
+- [x] The Terminal: ⌘J with a shell per thread and the play icon on a
+  reply's shell block (`terminal.*`)
 - [x] Slack, email and draft boxes in replies with Copy, and chips in your
   bubbles: pictures, thread ids and card mentions (`rich.draft`,
   `rich.*chips`, `transcript.user`, `transcript.agentmessage`)
@@ -48,8 +48,8 @@ you go.
 - [x] Selecting text in a reply has no Explain, Quote or Copy bar, and no
   Explain pane (`rich.selectionbar`, `rich.explain`)
 - [x] ⌘C copies plain text only, without the links (`rich.copy`)
-- [ ] Tables stretch to the column's width rather than their natural widths,
-  and list items sit a little closer than Swift's (`rich.table`, `rich.blocks`)
+- [x] Tables stop at their content width, fitting or scrolling inside the
+  available space, and list items have Swift's six-point gap (`rich.table`, `rich.blocks`)
 - [x] File names in replies don't find the files the thread's tools touched,
   and this Mac's documents and pictures open in their app, not the pane
   (`rich.filerefs`, `file.host`)

@@ -13,6 +13,7 @@ import path from 'node:path';
 import type { BackgroundTask, LooseEnd, Schedule } from './protocol.ts';
 import { MAIN, type WorktreeRecord } from './worktrees.ts';
 import { untrustedGit } from './safe-git.ts';
+import { cutSafely } from './safe-cut.ts';
 
 // Any repo a thread touched can be anyone's (a clone it just made, a folder
 // from a zip with its own .git/config), and these run by themselves when a
@@ -270,9 +271,22 @@ export function runningLooseEnds(tasks: BackgroundTask[]): LooseEnd[] {
     .filter((t) => !t.finished)
     .slice(0, MAX_RUNNING)
     .map((t) => {
-      const what = t.description.replace(/\s+/g, ' ').trim().replace(/\.+$/, '');
-      const short = what.length > MAX_JOB_CHARS ? `${what.slice(0, MAX_JOB_CHARS - 1).trimEnd()}…` : what;
-      return { kind: 'running' as const, text: `Still running: ${short || 'a background job'}. Archiving stops it.` };
+      // A Codex job's description is its whole command, which can hold a
+      // key. The line goes to Convex with words after it, so a plain cut
+      // through a key sent all but its last character: the scrub knows a
+      // cut-off key only at the very end of a text (Daybreak, 13 Nov 2026).
+      // So the cut moves back to before anything the scrub would take out,
+      // Nothing comes off its end either: dots taken off a key the scrub
+      // only learns of later would leave it unrecognisable (Codex's review).
+      const what = t.description.replace(/\s+/g, ' ').trim();
+      const short = cutSafely(what, MAX_JOB_CHARS, '…');
+      // Cut, its words go last, ending in the "…": a key the scrub learns
+      // of only after this line was made (a .env still being read) is then
+      // a cut-off value at the very end, which it does take out (Codex's
+      // review). Words after it hid it from that.
+      if (short !== what) return { kind: 'running' as const, text: `Still running (archiving stops it): ${short}` };
+      if (/[.!?…]$/.test(what)) return { kind: 'running' as const, text: `Still running: ${what} Archiving stops it.` };
+      return { kind: 'running' as const, text: `Still running: ${what || 'a background job'}. Archiving stops it.` };
     });
 }
 

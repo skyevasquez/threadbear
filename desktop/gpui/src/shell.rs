@@ -477,7 +477,7 @@ impl Threadbear {
     }
 
     pub(crate) fn open_thread(&self) -> Option<&threadbear_core::inbox::ThreadSummary> {
-        self.selected.as_ref().and_then(|id| self.threads.get(id))
+        self.selected.as_ref().and_then(|id| self.threads.get(id)).map(|t| &**t)
     }
 
     /// `WindowDock.section(_:)` != nil: a pane section's panel, not the
@@ -980,7 +980,7 @@ impl Threadbear {
             (Some(SidebarMode::Projects), _) => "Projects".to_string(),
             (Some(_), _) => "Librarian".to_string(),
             (None, Some(t)) if t.title.is_empty() => "Untitled".to_string(),
-            (None, Some(t)) => t.title,
+            (None, Some(t)) => t.title.clone(),
             (None, None) => "New thread".to_string(),
         })
     }
@@ -1419,6 +1419,10 @@ impl Threadbear {
 
     pub(crate) fn render_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         self.sync_window_title(window);
+        // The layer the sidebar's arcs turn in (spinner.rs), which looks at
+        // the dock to see when the Threads panel isn't in front.
+        let (dock, dock_view) = (self.dock.clone(), self.dock_view.clone());
+        let arc_layer = self.arc_layer.get_or_insert_with(|| cx.new(|_| crate::spinner::ArcLayer::new(dock, dock_view, THREADS))).clone();
         // With nothing focused GPUI's key dispatch doesn't reach this element's
         // key context or actions, so the shell keeps the keyboard when nothing
         // else has it (no thread open, a closed dialog).
@@ -1454,6 +1458,9 @@ impl Threadbear {
             .when_some(rail, |s, r| s.child(r))
             // An archived or hibernated thread's page on its way to its
             // heading, over the sidebar and the panel alike (archive_flight.rs).
+            // The sidebar's turning arcs, drawn here so a turn doesn't
+            // redraw the sidebar (spinner.rs).
+            .child(div().absolute().top_0().left_0().size_full().child(arc_layer))
             .child(self.flight.overlay(cx))
             .children(self.render_swipe_card(cx).map(|card| deferred(card).with_priority(1)))
             // The tour and the pages' intros, over everything (tour.rs).

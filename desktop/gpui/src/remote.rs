@@ -48,9 +48,14 @@ pub(crate) struct RemoteState {
 }
 
 impl Threadbear {
+    /// A thread's old runner let it go during a move: keep its row as that
+    /// runner's, with its move and so its locked box, until the destination
+    /// lists it (`remote::moved_away`, Daybreak 113). False when it isn't a
+    /// move, and the row should go.
     pub(crate) fn moved_away(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
-        let self_id = self.remote.all_runners.iter().find(|r| r.is_self).map(|r| r.id.as_str());
-        let Some(kept) = self.threads.get(id).and_then(|t| remote::moved_away(t, self_id)) else { return false };
+        let Some(kept) = self.threads.get(id).and_then(|t| remote::moved_away(t)) else { return false };
+        let self_id = self.remote.all_runners.iter().find(|r| r.is_self).map(|r| r.id.clone());
+        let here = remote::moving_to(&kept).is_some_and(|to| Some(to) == self_id.as_deref());
         self.remote.made.insert(id.to_owned());
         self.kept.forget(id, cx);
         let panes: Vec<_> = self.pane.iter().chain(self.subagent_pane.iter()).chain(self.thread_panels.panes()).cloned().collect();
@@ -63,11 +68,11 @@ impl Threadbear {
                 });
             }
         }
-        let local = !kept.is_remote();
-        self.threads.insert(id.to_owned(), kept);
-        // A local list is authoritative for a move back to this Mac. Remote
-        // routing is ready only once the destination appears in its index.
-        if local { self.load_list(cx); }
+        self.threads.insert(id.to_owned(), std::sync::Arc::new(kept));
+        // Only this Mac's own list says a move here has arrived (load_list
+        // takes it from `made` then); one to another runner arrives with
+        // that runner's index row (apply_remote_index).
+        if here { self.load_list(cx); }
         self.refresh_dock_badge();
         true
     }
@@ -163,22 +168,23 @@ impl Threadbear {
             let waiting = self.remote.made.contains(&summary.id);
             if let Some(current) = self.threads.get(&summary.id) {
                 if current.runner_id.is_none() && !waiting { continue; }
-                if waiting && current.runner_id != summary.runner_id {
-                    let self_id = self.remote.all_runners.iter().find(|r| r.is_self).map(|r| r.id.as_str());
-                    // An active source row can lag the destination, but a
-                    // cancellation or failure must restore the source.
-                    if remote::moved_away(&summary, self_id).is_some_and(|to| to.runner_id == current.runner_id) { continue; }
-                }
+                // While it waits on its move only the runner it's going to
+                // and the one it's leaving speak for it: an old Mac's
+                // lingering row can't take it, and the one it's leaving
+                // putting its row back keeps the thread that runner's,
+                // still locked with its move (Daybreak 113), rather than
+                // being ignored for a destination that never listed it.
+                if waiting && summary.runner_id != current.runner_id && summary.runner_id.as_deref() != remote::moving_to(current) { continue; }
             }
             listed.insert(summary.id.clone());
             let waiting = self.remote.made.remove(&summary.id);
-            let before = self.threads.insert(summary.id.clone(), summary.clone());
+            let before = self.threads.insert(summary.id.clone(), std::sync::Arc::new(summary.clone()));
             if waiting || before.as_ref().is_some_and(|old| old.runner_id != summary.runner_id) {
                 reload.insert(summary.id.clone());
             }
-            self.note_failed_account(before.as_ref(), &summary);
+            self.note_failed_account(before.as_deref(), &summary);
         }
-        let gone: Vec<String> = self.threads.values().filter(|t| self.remote.index.can_remove_missing() && t.runner_id.is_some() && !listed.contains(&t.id) && !self.remote.made.contains(&t.id)).map(|t| t.id.clone()).collect();
+        let gone: Vec<String> = self.threads.values().map(|t| &**t).filter(|t| self.remote.index.can_remove_missing() && t.runner_id.is_some() && !listed.contains(&t.id) && !self.remote.made.contains(&t.id)).map(|t| t.id.clone()).collect();
         for id in gone {
             if !self.moved_away(&id, cx) {
                 self.threads.remove(&id);
@@ -192,6 +198,8 @@ impl Threadbear {
         // runner, while the connection was down) goes from the kept ones.
         let listed: HashSet<String> = self.threads.keys().cloned().collect();
         self.kept.retain(cx, |id| listed.contains(id));
+        // Their titles' fades too (Daybreak 117).
+        crate::open_motion::forget_titles(|id| listed.contains(id));
     }
 
     pub(crate) fn sync_thread_panes(&mut self, reload: &HashSet<String>, cx: &mut Context<Self>) {

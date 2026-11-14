@@ -85,11 +85,52 @@ if [ "${1:-}" = "--on-host" ]; then
   umask 022
   mkdir -p "$TMPDIR"
   mv "$base/runs/$id" "$src" || { echo "The copy for run $id isn't on $(hostname -s)." >&2; exit 1; }
+  # Processes still working in this run's temp folder or its copy of the
+  # checkout when it ends (runs here take turns, under the lock): a test
+  # that timed out or failed partway can leave a child behind, and with its
+  # parent gone it goes to launchd and stays. Six `tb land`s from landing
+  # tests sat on Tinker Desk for days, waiting on a check nobody released
+  # (7 to 14 Nov), and kept it from ever looking idle. Found by working
+  # directory: /proc on Linux, lsof on macOS.
+  left_in_run() {
+    local dirs="" d
+    for d in "$TMPDIR" "$src"; do
+      d="$(cd "$d" 2>/dev/null && pwd -P)" && dirs+="$d"$'\n'
+    done
+    [ -n "$dirs" ] || return 0
+    if [ -d /proc/self ]; then
+      local p c
+      for p in /proc/[0-9]*; do
+        c="$(readlink "$p/cwd" 2>/dev/null)" || continue
+        while IFS= read -r d; do
+          [ -n "$d" ] || continue
+          case "$c" in "$d" | "$d"/*) echo "${p#/proc/}"; break ;; esac
+        done <<<"$dirs"
+      done
+    else
+      # Through the environment: awk -v won't take a newline on macOS.
+      lsof -nP -a -u "$(id -u)" -d cwd -Fpn 2>/dev/null | LEFT_DIRS="$dirs" awk '
+        BEGIN { n_d = split(ENVIRON["LEFT_DIRS"], d, "\n") }
+        /^p/ { pid = substr($0, 2) }
+        /^n/ { n = substr($0, 2); for (i = 1; i <= n_d; i++) if (d[i] != "" && (n == d[i] || index(n, d[i] "/") == 1)) { print pid; break } }'
+    fi | grep -vx "$$"
+  }
+  stop_left_in_run() {
+    local pids
+    pids="$(left_in_run | tr '\n' ' ')"
+    [ -n "${pids// /}" ] || return 0
+    kill $pids 2>/dev/null
+    sleep 1
+    pids="$(left_in_run | tr '\n' ' ')"
+    [ -z "${pids// /}" ] || kill -9 $pids 2>/dev/null
+  }
+
   # A failed check keeps its logs in $TMPDIR; they move aside for this
   # Mac to fetch, and everything else goes.
   keep_logs() {
     local rc=$?
     cd "$base" || return
+    stop_left_in_run
     # A failed run's free space, before its temp files go: if they're what
     # filled the disk, it'd look fine by the time this Mac asks (Codex's
     # review). The Mac falls back to asking if a full disk stops this write.
@@ -184,6 +225,24 @@ fi
 HOST_LIST="${1:?usage: check-remote.sh <ssh host>[,<ssh host>...] [check.sh options]}"
 shift
 read -ra HOSTS <<<"$(printf '%s' "$HOST_LIST" | tr ',' ' ')"
+# THREADBEAR_CHECK_PREFER: hosts to try first, the rest of the list still
+# behind them. tb land sets it for a group's check from what each landing in
+# it asked for (THREADBEAR_CHECK_HOST), as the check runs with the holder's
+# environment (runner/src/worktrees.ts, checkPreference). A host that can't
+# run this check is passed over as ever, so a group that needs a Mac still
+# goes to one.
+if [ -n "${THREADBEAR_CHECK_PREFER:-}" ]; then
+  ordered=()
+  for h in $(printf '%s' "$THREADBEAR_CHECK_PREFER" | tr ',' ' ') ${HOSTS[@]+"${HOSTS[@]}"}; do
+    [[ "$h" =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]] || continue
+    case " ${ordered[*]+"${ordered[*]}"} " in *" $h "*) continue ;; esac
+    ordered+=("$h")
+  done
+  if [ "${#ordered[@]}" -gt 0 ]; then
+    HOSTS=("${ordered[@]}")
+    HOST_LIST="$(IFS=,; printf '%s' "${HOSTS[*]}")"
+  fi
+fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/scripts/remote-guard-lib.sh"
 alive_stdin 7 || { echo "Couldn't make the pipe that tells a check host this check has gone (alive_stdin)." >&2; exit 1; }
@@ -383,6 +442,14 @@ if [ "$QUICK" = 1 ] && [ "$ALL" = 0 ] && [ -z "$SHOTS" ] && [ -s "$changed" ] \
 # it from a clone on main, where nothing has, and with Tinker Desk away a
 # Linux host should still take it rather than this Mac (Codex, 9 Nov).
 if [ "$RUNNER_ONLY" = 1 ] && [ -z "$SHOTS" ]; then linux_ok=1; fi
+# Why it needs a Mac, for the message when only Linux hosts answered.
+MAC_WHY="it isn't --quick"
+if [ "$QUICK" = 1 ]; then
+  if [ -n "$SHOTS" ]; then MAC_WHY="--shots"
+  elif [ "$ALL" = 1 ]; then MAC_WHY="--all"
+  elif [ ! -s "$changed" ]; then MAC_WHY="nothing changed from main, so it runs everything"
+  else MAC_WHY="it changes ios/, app/, dock/ or check.sh"; fi
+fi
 
 # The disk a run wants free on its host. On 7 Nov Tinker Desk fell under 1 GiB
 # and an --app check died with a CodeSign error that said nothing about space,
@@ -449,8 +516,15 @@ pass_over() {
   echo "Passing over $1: it has $FREE_GIB GiB free, and this check wants $MIN_FREE_GIB GiB." >&2
   LOW+="${LOW:+, }$1 has $FREE_GIB GiB free"
 }
+# Hosts that answered but can't run this kind of check, with why. They're
+# reachable, so a run none can take isn't this Mac's either (exit 1, each
+# host's reason said): only hosts nobody can reach send it here (255). On
+# 13 Nov a landing that asked only for the cloud box, with Swift in its
+# group, ran the runner's suites and the app's release build on Mike's M5.
+CANT="" CANT_COPY=""
+cant_run() { CANT+="${CANT:+; }$1: $2"; }
 choose() {
-  HOST="" HOST_OS="" remote_base="" FREE=0 LOW="$LOW_COPY"
+  HOST="" HOST_OS="" remote_base="" FREE=0 LOW="$LOW_COPY" CANT="$CANT_COPY"
   local first="" first_os="" first_base="" h out rc b os state kb
   for h in "${HOSTS[@]}"; do
     # An ssh host, never something ssh would take for an option.
@@ -477,8 +551,16 @@ choose() {
       # It answered, but a disk too full for the probe's mkdir fails it too,
       # and calling that unreachable would run the check on this Mac (Codex's
       # review). 255 is ssh itself: nobody there to ask.
-      if [ "$rc" != 255 ] && kb="$(watched "$h" "${SSH[@]}" "$h" "cd ~ && $free_cmd" 2>/dev/null)" && low_on_room "$kb"; then
-        pass_over "$h"
+      # One that answers the disk question has answered: whatever stopped
+      # the probe (a folder it can't make or lock), it's no reason to run the
+      # check here (Codex's review, 14 Nov).
+      if [ "$rc" != 255 ] && kb="$(watched "$h" "${SSH[@]}" "$h" "cd ~ && $free_cmd" 2>/dev/null)"; then
+        if low_on_room "$kb"; then pass_over "$h"
+        else cant_run "$h" "it answered, but couldn't make or lock ~/$BASE_REL there (exit $rc)"; fi
+      elif [ "$rc" != 255 ]; then
+        # Not ssh's own 255: it logged in and its commands failed (a home it
+        # can't open, say). Answered all the same (Codex, 14 Nov).
+        cant_run "$h" "it answered, but its commands there failed (exit $rc)"
       else
         echo "Couldn't reach $h over ssh." >&2
       fi
@@ -489,12 +571,12 @@ choose() {
     # the host's word, so it's only ever data: an absolute path of plain
     # characters ending in the folder asked for, else the host is passed
     # over (Daybreak, 7 Nov: it went into a sed program here).
-    if ! plain_path "$b"; then echo "Unexpected folder on $h (not a plain absolute path); passing it over." >&2; continue; fi
-    case "$b" in */$BASE_REL) ;; *) echo "Unexpected folder on $h: '$b'" >&2; continue ;; esac
+    if ! plain_path "$b"; then echo "Unexpected folder on $h (not a plain absolute path); passing it over." >&2; cant_run "$h" "its check folder isn't a plain absolute path"; continue; fi
+    case "$b" in */$BASE_REL) ;; *) echo "Unexpected folder on $h: '$b'" >&2; cant_run "$h" "its check folder isn't ~/$BASE_REL"; continue ;; esac
     case "$os" in
       Darwin) ;;
-      Linux) [ "$linux_ok" = 1 ] || continue ;;
-      *) continue ;;
+      Linux) [ "$linux_ok" = 1 ] || { cant_run "$h" "it's Linux, and this check needs a Mac ($MAC_WHY)"; continue; } ;;
+      *) cant_run "$h" "it runs $os, not macOS or Linux"; continue ;;
     esac
     # After the system, so a host that couldn't run this anyway isn't named.
     # Busy or free alike: waiting for a full disk gets nobody anywhere.
@@ -706,9 +788,34 @@ while :; do
     if [ -n "$LOW" ]; then
       # Not 255: a disk to clear isn't a reason to run it all on this Mac.
       echo "No check host has room for this check: $LOW, and it wants $MIN_FREE_GIB GiB. Free some space there and run it again." >&2
+      [ -z "$CANT" ] || echo "The others can't run it: $CANT." >&2
       exit "$BUSY_EXIT"
     fi
-    echo "None of $HOST_LIST can run this check now." >&2
+    if [ -n "$CANT" ]; then
+      echo "None of $HOST_LIST can run this check ($CANT), and it doesn't run on this Mac instead. Add a host that can to THREADBEAR_CHECK_HOST, or leave it unset for runner.json's." >&2
+      exit "$BUSY_EXIT"
+    fi
+    # The last word before this Mac takes the check: every host, on a fresh
+    # connection of its own. Any that logs in at all (anything but ssh's own
+    # 255, or no answer) is reachable, whatever went wrong on the way, and
+    # the M5 isn't the place for a check a reachable host couldn't take.
+    # Codex's reviews kept finding paths that took one for gone (a broken
+    # shared connection, a host back since it dropped, a login whose shell
+    # failed); asking here covers them all.
+    answering=""
+    for h in "${HOSTS[@]}"; do
+      case "$h" in -*|"") continue ;; esac
+      # A marker that came back proves a login, whatever the exit (a login
+      # shell can exit 124 itself; Codex's fourth review).
+      reply="$(timed 20 "${PING[@]}" "$h" echo tb-answers </dev/null 2>/dev/null)"
+      rc=$?
+      case "$reply:$rc" in *tb-answers*) answering+="${answering:+, }$h" ;; *:255|*:124) ;; *) answering+="${answering:+, }$h" ;; esac
+    done
+    if [ -n "$answering" ]; then
+      echo "None of $HOST_LIST could take this check${CANT:+ ($CANT)}, but $answering still answers, so it doesn't run on this Mac instead. Run it again when that host is back to normal." >&2
+      exit "$BUSY_EXIT"
+    fi
+    echo "None of $HOST_LIST can be reached, so this check can't run on any of them now." >&2
     exit 255
   fi
   if [ "$HOST" = "$copied_host" ]; then
@@ -765,6 +872,11 @@ while :; do
         LOW_COPY+="${LOW_COPY:+, }$HOST has $FREE_GIB GiB free"
       else
         echo "Couldn't copy this checkout to $HOST; trying the others." >&2
+        # Still answering: the copy failed there, not the link (a link that
+        # went is what sends a check to this Mac; Codex's review, 14 Nov).
+        if timed 20 "${PING[@]}" "$HOST" true </dev/null >/dev/null 2>&1; then
+          CANT_COPY+="${CANT_COPY:+; }$HOST: it answers, but the copy to it failed"
+        fi
       fi
       SKIP+=" $HOST"
       continue
@@ -851,6 +963,11 @@ while :; do
       echo "Lost the connection to $HOST during the check; trying the others." >&2
       SKIP+=" $HOST"
       timed 10 "${SSH[@]}" -O exit "$HOST" >/dev/null 2>&1
+      # A new connection still gets in: the check's channel broke, not the
+      # host, which is no reason to run it here (Codex, 14 Nov).
+      if timed 20 "${PING[@]}" "$HOST" true </dev/null >/dev/null 2>&1; then
+        CANT_COPY+="${CANT_COPY:+; }$HOST: the check's connection broke, though it still answers"
+      fi
     else
       dropped "$HOST"
     fi

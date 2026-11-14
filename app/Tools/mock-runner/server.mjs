@@ -753,6 +753,20 @@ async function dispatch(client, method, p) {
       setTimeout(() => fakeTurn(threadId, p.text, p.images ?? []), 10);
       return { thread: summary };
     }
+    // Reinstall now (protocol "Runner updates"): running at once, and up
+    // to date about 2 s later, as a reinstall with nothing busy goes.
+    case 'runner.reinstall': {
+      if (!updates.launcherChanged) return { reinstall: null };
+      updates.reinstall = { state: 'running', logFile: path.join(dataDir, 'runner', 'reinstall.log') };
+      broadcast('runner.updates', { updates });
+      setTimeout(() => {
+        delete updates.reinstall;
+        delete updates.launcherChanged;
+        delete updates.launcherReason;
+        broadcast('runner.updates', { updates });
+      }, 2000);
+      return { reinstall: updates.reinstall };
+    }
     // A fork's own Swift changes (protocol "Your changes to the old app"),
     // as mock.updates set them.
     case 'swiftChanges.list':
@@ -965,21 +979,7 @@ async function dispatch(client, method, p) {
       const t = need(p.threadId);
       const button = t.buttons?.get(p.buttonId);
       if (!button) throw rpcError(-32602, `Button not found: ${p.buttonId}`);
-      if (button.pressed || button.running) return { button: structuredClone(button) };
-      if (button.run) {
-        // Answers at once, running, then finishes, as the runner does.
-        const { failed: _failed, ...rest } = button;
-        const running = { ...rest, running: { at: iso() } };
-        t.buttons.set(running.id, running);
-        persist(t.summary.id, { type: 'button.updated', button: running });
-        setTimeout(() => {
-          const { running: _going, ...left } = running;
-          const done = { ...left, pressed: { at: iso(), threadId: t.summary.id }, ran: { ok: true, exitCode: 0, durationMs: 1500 } };
-          t.buttons.set(done.id, done);
-          persist(t.summary.id, { type: 'button.updated', button: done });
-        }, 1500 + slow.queueMs);
-        return { button: structuredClone(running) };
-      }
+      if (button.pressed) return { button: structuredClone(button) };
       await new Promise((resolve) => setTimeout(resolve, 600 + slow.queueMs));
       const from = `[Sent by the agent in the thread "${t.summary.title}" (${t.summary.id.slice(0, 8)})]\n\n`;
       let next;
@@ -1651,6 +1651,14 @@ async function dispatch(client, method, p) {
       }
       return { ok: true };
     }
+    // The old runner puts its row back without the move finishing, as a
+    // secondary runner can (Daybreak 113): the thread is still its own.
+    case 'mock.moveSourceBack': {
+      const t = need(p.threadId);
+      delete t.awaitingDestination;
+      for (const c of clients) if (c.authed && c.as === null) send(c, 'remoteThreads.updated', remoteThreads(c));
+      return { ok: true };
+    }
     case 'mock.moveIndexRestart': {
       const t = need(p.threadId);
       t.movingDestination = null;
@@ -1748,6 +1756,7 @@ async function dispatch(client, method, p) {
       updates = { state: p.state ?? 'idle', oldRunners: Array.isArray(p.oldRunners) ? p.oldRunners : [] };
       for (const k of ['commit', 'subject', 'reason', 'launcherReason', 'webRuntimeProblem']) if (typeof p[k] === 'string') updates[k] = p[k];
       if (p.launcherChanged) updates.launcherChanged = true;
+      if (p.reinstall && typeof p.reinstall === 'object') updates.reinstall = p.reinstall;
       // Mike's releases (protocol "Mike's releases"), as given.
       if (p.upstream && typeof p.upstream === 'object') updates.upstream = p.upstream;
       // A fork's own Swift changes (protocol "Your changes to the old app").
@@ -1784,30 +1793,17 @@ async function dispatch(client, method, p) {
       // A thread for the Terminal's specs: `cwd` makes its folder a real one
       // (a temp folder the spec made, as the demo threads' are Mike's), and
       // a finished turn after it with a reply holding a ```bash block of
-      // `block`, or a card whose ask carries `run`, a command to run from it
-      // (docs/protocol.md, "Run on the card").
+      // `block`.
       const t = need(p.threadId);
       const id = t.summary.id;
       if (p.cwd) t.summary.cwd = p.cwd;
-      if (p.block || p.run) {
+      if (p.block) {
         const turnId = 'turn_' + crypto.randomBytes(4).toString('hex');
         persist(id, { type: 'user.message', text: p.ask ?? 'What do I run?', images: [] }, turnId);
         persist(id, { type: 'turn.started', turnId }, turnId);
-        if (p.block) persist(id, { type: 'assistant.text', itemId: 'term_' + crypto.randomBytes(4).toString('hex'), text: `Run this in the repo:\n\n\`\`\`bash\n${p.block}\n\`\`\`\n` }, turnId);
-        if (p.run) {
-          const buttonId = crypto.randomBytes(6).toString('base64').replace(/[^a-z0-9]/gi, '').toLowerCase().padEnd(8, 'x').slice(0, 8);
-          const run = { command: p.run, cwd: t.summary.cwd };
-          const button = { id: buttonId, title: 'Run', createdAt: iso(), turnId, run };
-          t.buttons ??= new Map();
-          t.buttons.set(buttonId, button);
-          persist(id, { type: 'button.updated', button }, turnId);
-          const asks = [{ action: p.action ?? 'Run the migration on the dev database', why: 'It needs your database password, so I can\'t run it myself.', run: { ...run, buttonId } }];
-          persist(id, { type: 'turn.completed', turnId, outcome: 'completed', durationMs: 1200, needs: 'you', asks }, turnId);
-          setStatus(id, 'idle', true);
-        } else {
-          persist(id, { type: 'turn.completed', turnId, outcome: 'completed', durationMs: 1200 }, turnId);
-          setStatus(id, 'idle');
-        }
+        persist(id, { type: 'assistant.text', itemId: 'term_' + crypto.randomBytes(4).toString('hex'), text: `Run this in the repo:\n\n\`\`\`bash\n${p.block}\n\`\`\`\n` }, turnId);
+        persist(id, { type: 'turn.completed', turnId, outcome: 'completed', durationMs: 1200 }, turnId);
+        setStatus(id, 'idle');
       } else {
         broadcastSummary(id);
       }

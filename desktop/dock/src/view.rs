@@ -180,6 +180,30 @@ impl DockView {
         self.last_motion.as_ref().map(|(from, to)| (from, to, self.motion.is_some()))
     }
 
+    /// Whether `panel` is drawn in this window now: the front panel of a group
+    /// the dock draws, walking the layout as `node` and `split` do (a split
+    /// leaves out children with nothing to show, unless none has anything;
+    /// a group's front is the first tab with something to show, as `group`
+    /// has it). Not one out in a window of its own.
+    pub fn shows(&self, panel: &str, cx: &App) -> bool {
+        let content = self.content.clone();
+        let is_available = |p: &str| content.available(p, cx);
+        fn walk(node: &DockNode, panel: &str, is_available: &dyn Fn(&str) -> bool) -> bool {
+            match node {
+                DockNode::Group(g) => dl::visible_group(g, is_available).selected == panel,
+                DockNode::Split(s) => dl::shown_indices(s, is_available).into_iter().any(|i| walk(&s.children[i], panel, is_available)),
+            }
+        }
+        walk(&self.model.read(cx).layout().root, panel, &is_available)
+    }
+
+    /// Whether a dropped panel's ghost is still flying to where it landed.
+    /// Something drawn over the dock (the app's turning arcs) keeps out of
+    /// the way while it does, as while the panel's dragged.
+    pub fn is_landing(&self) -> bool {
+        self.landing.is_some()
+    }
+
     /// Whether the last press on a bar moved the window or picked up a panel.
     /// Something in a bar that acts on a click (the thread's title renames)
     /// checks this from its click handler, which runs on the same release,

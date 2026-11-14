@@ -30,6 +30,19 @@ export const SCENARIOS: Scenario[] = [
     },
   },
   {
+    name: 'a message saved after Stop before the model started',
+    shows: ['Please fix the spot in this picture.', 'Your stopped message and pictures are saved for your next message.', 'Continuing on another model.', 'I can fix the spot.'],
+    play: (p) => {
+      p.say('Ready.');
+      p.endTurn({ needs: 'nothing' });
+      p.send('Please fix the spot in this picture.');
+      p.earlyStop();
+      p.send('Continuing on another model.');
+      p.say('I can fix the spot.');
+      p.endTurn({ needs: 'nothing' });
+    },
+  },
+  {
     name: 'a message sent from the phone app',
     shows: ['The photo can wait until tomorrow.'],
     play: (p) => {
@@ -79,15 +92,6 @@ export const SCENARIOS: Scenario[] = [
         { question: 'Deploy the fix?', options: [{ label: 'Deploy' }, { label: 'Wait' }], links: [{ title: 'See the diff', url: 'https://github.com/mikecann/threadbear/pull/1' }] },
         { question: 'Plug in the phone and say when.' },
       ] });
-    },
-  },
-  {
-    name: 'a card with a command to run',
-    shows: ['Backfill the titles on prod?', 'npx convex run --prod migrations:backfill'],
-    play: (p) => {
-      p.say('It needs your OK for prod.');
-      p.runAsks();
-      p.endTurn({ needs: 'you', asks: [{ question: 'Backfill the titles on prod?', run: 'npx convex run --prod migrations:backfill' }] });
     },
   },
   {

@@ -84,7 +84,7 @@ export function isCodexLogin(dir: string): boolean {
   return store === 'keyring' || store === 'auto';
 }
 
-export type DiscoveryConfig = Pick<Config, 'claudeMainDir' | 'claudeMainJson' | 'tokenStatsAccountsDir'> &
+export type DiscoveryConfig = Pick<Config, 'claudeMainDir' | 'claudeMainJson' | 'tokenStatsAccountsDir' | 'userHome' | 'pathEnv'> &
   Partial<Pick<Config, 'codexMainDir' | 'accountNotes' | 'accountsDir' | 'home' | 'cursorPath' | 'opencodePath'>>;
 
 // claude-main is ~/.claude (its .claude.json sits at ~/.claude.json);
@@ -122,7 +122,7 @@ export function discoverAccounts(cfg: DiscoveryConfig): Account[] {
   for (const { id, dir } of [...codex, ...numbered('codex')]) {
     if (isCodexLogin(dir)) out.push(codexAccount(id, dir));
   }
-  out.push(...acpAccounts({ paths: { cursor: cfg.cursorPath, opencode: cfg.opencodePath } }));
+  out.push(...acpAccounts({ home: cfg.userHome, pathEnv: cfg.pathEnv, paths: { cursor: cfg.cursorPath, opencode: cfg.opencodePath } }));
   for (const a of out) {
     const note = cfg.accountNotes?.[a.id];
     if (note) a.note = note;

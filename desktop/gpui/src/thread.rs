@@ -977,7 +977,9 @@ impl ThreadPane {
         self.show_outbox(cx);
         self.scroller.update(cx, |s, cx| s.scroll_to_end(cx));
 
-        let mut params = json!({ "threadId": thread_id, "text": text });
+        // The runner it's shown on (null for this Mac's), so this Mac's
+        // runner refuses it rather than passing it to any other (Daybreak 113).
+        let mut params = json!({ "threadId": thread_id, "text": text, "runnerId": self.summary.runner_id });
         if !images.is_empty() {
             params["images"] = json!(images.iter().map(crate::composer::image_ref_json).collect::<Vec<_>>());
         }
@@ -1192,6 +1194,31 @@ impl ThreadPane {
         self.load_older_if_near_top(cx);
         if self.loaded {
             crate::rows::remember_scroll(&self.summary.id, self.capture_memory(cx));
+        }
+    }
+
+    /// Its first page is in (a handover waits for the open thread's).
+    pub(crate) fn is_loaded(&self) -> bool {
+        self.loaded
+    }
+
+    /// Still bringing older pages in to get back to a remembered place.
+    pub(crate) fn restoring_place(&self) -> bool {
+        self.rows.pending_restore.is_some()
+    }
+
+    /// Where the outgoing app had this thread scrolled to as it handed over.
+    pub(crate) fn take_handed_memory(&mut self, memory: crate::rows::ScrollMemory, cx: &mut Context<Self>) {
+        if !self.loaded {
+            return;
+        }
+        // The place it was still paging back to is the old one now
+        // (Codex's second look).
+        self.rows.pending_restore = None;
+        if memory.pinned {
+            self.scroller.update(cx, |s, cx| s.scroll_to_end(cx));
+        } else {
+            self.restore_memory(Some(memory), cx);
         }
     }
 

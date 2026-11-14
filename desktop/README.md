@@ -51,6 +51,11 @@ folder browser.
   Support/Threadbear`, which the runner uses on Linux too), on the port from
   its `runner.json` (default 8797), as `tb` finds it.
 
+The vendored base text style has two opt-in settings for reply Markdown:
+`table_natural_width` caps short tables at their measured content width, and
+`list_item_gap` sets the space between items. The kit defaults stay unchanged;
+`gpui/src/rows/markdown.rs` enables them for Threadbear replies.
+
 ## Run it
 
 You need Rust (`rustup`) and Node 24. On a Mac you also need Xcode's command
@@ -140,6 +145,15 @@ comes from embedded bytes, even when the registry is present.
 
 The printed build log receives both output streams as the build runs,
 whether here or on another Mac. Failed builds keep the full log.
+
+`context-menus` lists the popup menus actually drawn in the scripted window,
+with each menu's item titles. It reads the rendered menus rather than
+calling a menu builder, so a test can catch two menus opening for one click.
+
+`peek` with `picture: true` reports the PDF/video hover card’s actual cached
+image dimensions or its loading/failure state. On a Mac,
+`bash desktop/scripts/test-media-hover.sh` checks descriptor ownership, bounds,
+private snapshots and late decoder callbacks with generated media.
 
 ## Seeing it on a server
 

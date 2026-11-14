@@ -285,6 +285,8 @@ pub struct Threadbear {
     pub(crate) flight: crate::archive_flight::Flights,
     /// How the next thread opens, and the new-thread page coming up (open_motion.rs).
     pub(crate) opening: crate::open_motion::Openings,
+    /// The layer the sidebar's turning arcs are drawn in (spinner.rs).
+    pub(crate) arc_layer: Option<Entity<crate::spinner::ArcLayer>>,
     /// The first-run tour and the pages' intros (tour.rs).
     pub(crate) tour: crate::tour::TourState,
     /// Finish setting up's devices (setup_panel.rs).
@@ -401,14 +403,19 @@ impl Threadbear {
         let frame = cx.observe_window_bounds(window, |this, window, cx| this.window_frame_changed(window, cx));
         // What's typed and not sent is written as the app quits (drafts.rs).
         let quitting = cx.on_app_quit(|this, cx| {
+            // Handed over to the new build (handover.rs): the drafts and the
+            // settings are its to write now, and it's already in place.
+            let handed_over = crate::handover::handed_over();
             // Messages still held for a restarting runner stay held, so the
             // drafts written next can keep them without one also going.
-            this.client.stop_holding();
-            this.save_drafts(cx);
-            // A setting changed in the last moment waits for the throttled
-            // save (`save_settings_soon`), which a quit would otherwise lose.
-            if std::mem::take(&mut this.settings_dirty) {
-                this.settings.save();
+            if !handed_over {
+                this.client.stop_holding();
+                this.save_drafts(cx);
+                // A setting changed in the last moment waits for the throttled
+                // save (`save_settings_soon`), which a quit would otherwise lose.
+                if std::mem::take(&mut this.settings_dirty) {
+                    this.settings.save();
+                }
             }
             // The activity log's last line (activity.rs).
             crate::activity::quit();
@@ -578,6 +585,7 @@ impl Threadbear {
             swipe_nav: Default::default(),
             flight: Default::default(),
             opening: Default::default(),
+            arc_layer: None,
             tour: crate::tour::TourState::new(),
             setup: Default::default(),
             _events: events,
@@ -590,6 +598,9 @@ impl Threadbear {
         // made itself for an update (app_update.rs).
         this.start_updater(cx);
         this.restore_after_update(cx);
+        // The incoming side of a handover: shows itself under the old window
+        // once it's loaded, then takes over (handover.rs).
+        this.start_incoming(cx);
         // The window starts on the Inbox with nothing open (`noteNavigation`
         // on launch), so Back from the first thread comes back here.
         this.note_navigation();
@@ -876,9 +887,9 @@ impl Threadbear {
                         if let Some(pane) = self.kept.get(&t.id, cx) {
                             pane.update(cx, |p, cx| p.summary_changed(&t, cx));
                         }
-                        let before = self.threads.insert(t.id.clone(), t.clone());
-                        self.note_failed_account(before.as_ref(), &t);
-                        self.thread_changed_outside(before.as_ref(), &t, cx);
+                        let before = self.threads.insert(t.id.clone(), Arc::new(t.clone()));
+                        self.note_failed_account(before.as_deref(), &t);
+                        self.thread_changed_outside(before.as_deref(), &t, cx);
                         if t.panel_request.is_some() && self.selected.as_deref() == Some(t.id.as_str()) {
                             self.serve_panel_request(cx);
                         }
@@ -894,6 +905,7 @@ impl Threadbear {
                     let id = params["threadId"].as_str().unwrap_or("");
                     crate::terminal::thread_deleted(id, cx);
                     if !self.moved_away(id, cx) {
+                        crate::open_motion::forget_titles(|t| t != id);
                         self.kept.forget(id, cx);
                         // Its panel of its own goes with it (`forget`).
                         self.close_thread_panel(id, cx);
@@ -985,7 +997,7 @@ impl Threadbear {
 
     /// The Dock badge: the threads waiting on Mike (`refreshDockBadge`).
     pub(crate) fn refresh_dock_badge(&mut self) {
-        let label = threadbear_core::inbox::dock_badge(threadbear_core::inbox::needs_you_count(self.threads.values(), now_ms()));
+        let label = threadbear_core::inbox::dock_badge(threadbear_core::inbox::needs_you_count(self.threads.values().map(|t| &**t), now_ms()));
         if label != self.dock_badge {
             crate::notify::set_badge(label.as_deref());
             self.dock_badge = label;
@@ -1048,7 +1060,7 @@ impl Threadbear {
                         // even when another row could not be read.
                         for thread in &list.rows { crate::terminal::thread_updated(thread, cx); }
                         let before = (*this.threads).clone();
-                        let cleanup = list.apply(&mut this.threads);
+                        let cleanup = list.apply(&mut *this.threads);
                         let reload: std::collections::HashSet<_> = confirmed.iter().filter(|id| {
                             this.remote.made.contains(*id) || before.get(*id).is_some_and(|t| t.is_remote())
                         }).cloned().collect();
@@ -1245,7 +1257,7 @@ impl Threadbear {
                 });
                 pane
             }
-            (None, None) => cx.new(|cx| ThreadPane::new(client, summary, composer.clone(), cx)),
+            (None, None) => cx.new(|cx| ThreadPane::new(client, ThreadSummary::clone(&summary), composer.clone(), cx)),
         };
         let reduce = cx.reduce_motion();
         pane.update(cx, |p, _| p.entering = crate::open_motion::Entering::new(opening, reduce));
@@ -1319,7 +1331,7 @@ impl Threadbear {
         self.close_subagent(cx);
         let (Some(summary), Some(composer)) = (self.threads.get(&thread_id).cloned(), self.composers.get(&thread_id).cloned()) else { return };
         let client = self.client.clone();
-        let pane = cx.new(|cx| ThreadPane::new_subagent(client, summary, subagent_id.clone(), composer, cx));
+        let pane = cx.new(|cx| ThreadPane::new_subagent(client, ThreadSummary::clone(&summary), subagent_id.clone(), composer, cx));
         // A thread: link in its transcript opens that thread, as in a thread's.
         self.subagent_events = Some(cx.subscribe_in(&pane, window, |this, _, event: &crate::rows::OpenThreadRequest, window, cx| this.open_thread_link(&event.0, window, cx)));
         self.subagent = Some((thread_id, subagent_id));
@@ -1361,7 +1373,7 @@ impl Threadbear {
     pub(crate) fn update_open(&mut self, change: impl FnOnce(&mut ThreadSummary), params: Value, cx: &mut Context<Self>) -> Result<(), String> {
         let Some(id) = self.selected.clone() else { return Err("no thread open".into()) };
         let before = self.threads.get(&id).cloned();
-        if let Some(t) = self.threads.get_mut(&id) {
+        if let Some(t) = self.threads.get_mut(&id).map(std::sync::Arc::make_mut) {
             change(t);
         }
         let guess = self.threads.get(&id).cloned();
@@ -1389,7 +1401,7 @@ impl Threadbear {
                 }
                 if let Err(e) = res {
                     this.show_error(e.message, cx);
-                    threadbear_core::inbox::roll_back(&mut this.threads, before, guess.as_ref());
+                    threadbear_core::inbox::roll_back(&mut *this.threads, before, guess.as_deref());
                 }
                 cx.notify();
             })
@@ -1639,9 +1651,6 @@ impl Threadbear {
             if let Some(answers) = composer.answer_chip_lines(cx) {
                 out["answers"] = json!(answers);
             }
-            if let Some(runs) = crate::card_run::composer_lines(composer, cx) {
-                out["cardRuns"] = json!(runs);
-            }
         }
         out
     }
@@ -1652,7 +1661,7 @@ impl Threadbear {
     /// ran out since: the list, its badge and the arrow keys each ask for it,
     /// every frame, and sorting all of Mike's threads each time was half a
     /// frame's work (thread_map.rs).
-    pub(crate) fn shown_sections(&self, cx: &App, now: i64) -> Rc<Vec<inbox::Section>> {
+    pub(crate) fn shown_sections(&self, cx: &App, now: i64) -> Rc<Vec<inbox::Section<Arc<ThreadSummary>>>> {
         let query = self.search.read(cx).value().trim().to_lowercase();
         let wakes = inbox::wakes(&self.scheduled.list);
         let changes = self.threads.changes();
@@ -1661,10 +1670,11 @@ impl Threadbear {
                 return c.sections.clone();
             }
         }
+        // Shared rows: working them out again copies pointers (thread_map.rs).
         let sections = Rc::new(inbox::sections_ordered(self.threads.values().filter(|t| query.is_empty() || inbox::matches(t, &query)), now, self.sidebar.order, &wakes));
         // Until the next snooze runs out, when a thread moves out of
         // Hibernating; nothing else in the sorting goes by the clock.
-        let until = self.threads.values().filter_map(|t| t.snoozed_until_ms()).filter(|at| *at > now).min().unwrap_or(i64::MAX);
+        let until = self.threads.values().map(|t| &**t).filter_map(|t| t.snoozed_until_ms()).filter(|at| *at > now).min().unwrap_or(i64::MAX);
         *self.sections_cache.borrow_mut() = Some(SectionsCache { changes, query, order: self.sidebar.order, wakes, from: now, until, sections: sections.clone() });
         sections
     }
@@ -1795,5 +1805,5 @@ struct SectionsCache {
     /// The clock it was worked out at, and when it next needs to be again.
     from: i64,
     until: i64,
-    sections: Rc<Vec<inbox::Section>>,
+    sections: Rc<Vec<inbox::Section<Arc<ThreadSummary>>>>,
 }

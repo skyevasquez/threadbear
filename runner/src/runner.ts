@@ -1,6 +1,7 @@
 // The thread manager: owns threads, turns, the event log, approvals, idle
 // release and snoozes. Providers plug in through AgentAdapter; the WebSocket
 // server in rpc.ts is a thin layer over the public methods here.
+import type { ReinstallStatus } from './reinstall.ts';
 import { RELEASE } from './release.ts';
 import type { UserInput } from './adapters/types.ts';
 import { INSTRUCTIONS_CLEARED, INSTRUCTIONS_REWOUND } from './instructions.ts';
@@ -33,6 +34,7 @@ import type {
   EventBody,
   ImageRef,
   InProgressItem,
+  Ask,
   AskAnswer,
   MessageOrigin,
   ModelChoice,
@@ -73,7 +75,7 @@ import type {
 } from './adapters/types.ts';
 import { SessionNotFoundError } from './adapters/types.ts';
 import type { RewindResult } from './adapters/types.ts';
-import type { ThreadRecord, ThreadStore, QueuedSend, SubagentRecord } from './store.ts';
+import type { EventLog, ThreadRecord, ThreadStore, QueuedSend, SubagentRecord } from './store.ts';
 import { cutOut } from './store.ts';
 
 // The presses a thread keeps for its agent to hear of (Runner.notePress).
@@ -193,6 +195,10 @@ export type RunnerUpdates = {
   oldRunners: { version: string; threads: string[] }[];
   launcherChanged?: true;
   launcherReason?: string;
+  // The checkout this runner follows (install-runner.sh's), and what's
+  // being done about launcherChanged (reinstall.ts).
+  checkout?: string;
+  reinstall?: ReinstallStatus;
   // Mike's releases, for a fork (upstream.ts); left out while off.
   upstream?: UpstreamStatus;
   // This machine isn't following GitHub's main properly (follow-origin.ts).
@@ -305,6 +311,15 @@ export type Turn = {
   // sent while it ran, which go straight into the CLI. The turn ends when
   // the CLI has answered them all.
   messages: string[];
+  modelOutput?: boolean;
+  dispatched?: boolean;
+  recoveredMessages?: number[];
+  recoveryInput?: string;
+  inputs?: Map<string, number>;
+  deliveryKnown?: boolean;
+  startedMessages?: Set<string>;
+  cancelledMessages?: Set<string>;
+  foreignOutput?: boolean;
   // The most access the CLI has had in this turn (accessOf): a Codex turn
   // keeps the mode it started with when the thread is lowered mid-turn.
   access?: PermissionMode;
@@ -546,6 +561,11 @@ export const DRAIN_AGENT_MS = 4 * 60 * 60_000;
 export const SAVE_RETRY_MS = 5000;
 
 export type RunnerDeps = {
+  // A message that answers the thread's open card (`answers`, which only
+  // the app, the phone and the website send: an agent's are taken out,
+  // rpc-gate.ts), with that card's asks. For an answer the runner acts on
+  // itself, like the full sync question's (main.ts).
+  answered?: (threadId: string, answers: AskAnswer[], card: Ask[] | undefined) => void;
   // The release it runs, when not this code's own (tests).
   release?: string;
   // A thread's RPC credential, for its CLI's environment (rpc-auth.ts).
@@ -767,8 +787,10 @@ export class Runner {
   atMac?: () => boolean | undefined;
 
   private threadKey?: (threadId: string) => string;
+  private answered?: RunnerDeps['answered'];
   constructor(deps: RunnerDeps) {
     this.threadKey = deps.threadKey;
+    this.answered = deps.answered;
     if ('release' in deps) this.release = deps.release;
     this.cfg = deps.config;
     this.store = deps.store;
@@ -1506,6 +1528,70 @@ export class Runner {
   // origin "runner" marks a message the runner sends by itself (restart.ts),
   // "schedule" one a schedule sent (schedules.ts). `queue` keeps it out of a
   // running turn: it waits and starts its own.
+  // Cache only the keys looked up. New deliveries search backwards through
+  // their possible lifetime, rather than parsing the thread's whole history.
+  private scheduledMessages = new WeakMap<EventLog, Map<string, { through: number; since: number; message?: { seq: number; started: boolean; text: string; images: ImageRef[] } }>>();
+
+  private scheduledMessage(st: ThreadState, messageId: string, since: number) {
+    // A schedule/request may have been timestamped by another runner.
+    since = Math.max(0, since - 5 * 60_000);
+    const log = this.store.log(st.rec.id);
+    let index = this.scheduledMessages.get(log);
+    if (!index) { index = new Map(); this.scheduledMessages.set(log, index); }
+    const cached = index.get(messageId);
+    if (cached?.message?.started && cached.through <= log.lastSeq) return cached.message;
+    if (cached?.through === log.lastSeq && cached.since <= since) return cached.message;
+    const last = log.lastSeq;
+    // A miss already checked the prefix for this time window. Streaming
+    // after it only makes the appended suffix new work. A wider window or
+    // a shorter log must search again from the beginning.
+    const reuse = cached && cached.through <= last && cached.since <= since;
+    const from = reuse ? cached.through + 1 : 1;
+    let message = reuse ? cached.message : undefined;
+    let started = message?.started ?? false;
+    const finish = () => {
+      const found = message && { ...message, started };
+      index.set(messageId, { through: last, since, message: found });
+      return found;
+    };
+    for (let to = last; to >= from; to -= 128) {
+      const events = log.read(Math.max(from, to - 127), to);
+      for (let i = events.length - 1; i >= 0; i--) {
+        const e = events[i];
+        if (e.turnId === messageId) {
+          if (e.type === 'turn.started') {
+            started = true;
+            if (message) return finish();
+          }
+          if (e.type === 'user.message' && e.origin === 'schedule') {
+            message = { seq: e.seq, started, text: e.text, images: e.images };
+            return finish();
+          }
+        }
+        if (Date.parse(e.ts) < since) return finish();
+      }
+    }
+    return finish();
+  }
+
+  findScheduledSend(threadId: string, scheduleId: string, run?: string, since = 0): { turnId: string } | undefined {
+    if (!run) return undefined;
+    const st = this.mustGet(threadId);
+    const turnId = scheduledMessageId(threadId, scheduleId, run);
+    if (st.rec.queue.some((q) => q.turnId === turnId) || this.scheduledMessage(st, turnId, since)?.started) return { turnId };
+    return undefined;
+  }
+
+  sendScheduled(threadId: string, text: string, scheduleId: string, run?: string, since = 0): { turnId: string } {
+    const prior = this.findScheduledSend(threadId, scheduleId, run, since);
+    if (prior) return prior;
+    const messageId = run ? scheduledMessageId(threadId, scheduleId, run) : undefined;
+    const logged = messageId ? this.scheduledMessage(this.mustGet(threadId), messageId, since) : undefined;
+    // A partial start retries the original logged input, including its check
+    // output, so the model reads exactly what the transcript shows.
+    return this.send(threadId, logged?.text ?? text, logged?.images ?? [], { origin: 'schedule', scheduleId, queue: true, ...(messageId ? { messageId, scheduledSince: since } : {}) });
+  }
+
   send(threadId: string, text: string, images: ImageRef[] = [], opts: SendOptions = {}): { turnId: string } {
     const st = this.mustGet(threadId);
     this.checkAccepting();
@@ -1523,6 +1609,14 @@ export class Runner {
 
   sendTo(st: ThreadState, text: string, images: ImageRef[], opts: SendOptions = {}): string {
     const { rec, rt } = st;
+    if (opts.answers?.length && fromMike(text, opts) && this.answered) {
+      const open = rec.needs?.needs === 'you' && rec.needs.seq === rec.lastTurnCompletedSeq ? rec.needs.asks : undefined;
+      try {
+        this.answered(rec.id, opts.answers, open);
+      } catch (e) {
+        this.log.warn('acting on an answer failed', { threadId: rec.id, error: String((e as Error)?.message ?? e) });
+      }
+    }
     if (opts.origin !== 'runner') {
       rt.hookTurns = undefined;
       delete rec.stoppedWorkWakes;
@@ -1573,10 +1667,11 @@ export class Runner {
       this.endPanelWait(st, false);
       this.markDirty(st);
     }
-    const turnId = crypto.randomUUID();
+    const turnId = opts.messageId ?? crypto.randomUUID();
     const msg: QueuedSend = { turnId, text, images: refs };
     if (opts.origin) msg.origin = opts.origin;
     if (opts.scheduleId) msg.scheduleId = opts.scheduleId;
+    if (opts.scheduledSince !== undefined) msg.scheduledSince = opts.scheduledSince;
     if (opts.answers?.length) msg.answers = opts.answers;
     if (opts.editOf) msg.editOf = opts.editOf;
     rec.lastActivityAt = this.isoNow();
@@ -1685,7 +1780,8 @@ export class Runner {
   steer(st: ThreadState, msg: QueuedSend): void {
     const { rt } = st;
     const turn = rt.turn!;
-    this.emit(st, userMessage(msg), turn.turnId);
+    const event = this.emit(st, userMessage(msg), turn.turnId);
+    (turn.inputs ??= new Map()).set(msg.turnId, event.seq);
     turn.messages.push(msg.turnId);
     // He wrote again, so the turn owes him another reply.
     turn.ended = false;
@@ -1700,7 +1796,9 @@ export class Runner {
     this.markDirty(st);
     // A change reaches a running turn too, or a clear could wait out as many
     // messages as were sent into it (Codex review).
-    this.sendWithInstructionsNews(st, { id: msg.turnId, text: this.forAgent(msg), images: msg.images });
+    turn.dispatched = true;
+    if (!turn.deliveryKnown) turn.foreignOutput = false;
+    this.sendWithInstructionsNews(st, this.withInterruptedMessages(st, msg, this.forAgent(msg)));
   }
 
   // A turn that had its end_turn, opened again once the agent has read a
@@ -1744,8 +1842,9 @@ export class Runner {
     delete rec.finished;
     // A review can be replayed after a failed turn.started append. Its
     // stable message ID keeps the original user row rather than duplicating it.
-    const hasReviewMessage = msg.reviewId && this.store.log(rec.id).read(1, rec.lastSeq).some(e => e.type === 'user.message' && e.reviewId === msg.reviewId && e.turnId === msg.turnId);
-    if (!hasReviewMessage) this.emit(st, userMessage(msg), msg.turnId);
+    const reviewMessage = msg.reviewId ? this.store.log(rec.id).read(1, rec.lastSeq).find(e => e.type === 'user.message' && e.reviewId === msg.reviewId && e.turnId === msg.turnId) : undefined;
+    const scheduledMessage = msg.scheduledSince !== undefined ? this.scheduledMessage(st, msg.turnId, msg.scheduledSince) : undefined;
+    const messageSeq = reviewMessage?.seq ?? scheduledMessage?.seq ?? this.emit(st, userMessage(msg), msg.turnId).seq;
     try {
       this.emit(st, { type: 'turn.started', turnId: msg.turnId }, msg.turnId);
     } catch (e) {
@@ -1755,6 +1854,7 @@ export class Runner {
     rt.idleTimer?.cancel();
     rt.idleTimer = undefined;
     rt.turn = { turnId: msg.turnId, startedAt: this.clock.now(), interruptRequested: false, messages: [msg.turnId], edited: new Set(), access: rec.permissionMode };
+    rt.turn.inputs = new Map([[msg.turnId, messageSeq]]);
     rt.activeAt = this.clock.now();
     rec.turnId = msg.turnId;
     rec.lastActivityAt = this.isoNow();
@@ -1806,11 +1906,16 @@ export class Runner {
     // A slash command reaches the CLI as typed: anything put in front of it
     // (the phone's line, project news) would make it words to the model.
     const command = this.commandPlan(st, msg.text);
+    if (command && /^\/clear\b/i.test(msg.text.trim())) {
+      delete rec.interruptedMessages;
+      delete rec.messageRecoveries;
+    }
     if (command && rt.turn) {
       rt.turn.command = true;
       if (/^\/(compact|review|clear)\b/i.test(msg.text.trim())) rt.turn.noSteer = true;
     }
-    let text = command ? msg.text : this.forAgent(msg);
+    const input = command ? { id: msg.turnId, text: msg.text, images: msg.images } : this.withInterruptedMessages(st, msg, this.forAgent(msg));
+    let text = input.text;
     // Claude's CLI starts a new session for /clear, which the runner follows
     // (its next init), but says nothing.
     if (command && rec.provider === 'claude' && /^\/clear\b/i.test(msg.text.trim())) {
@@ -1887,8 +1992,9 @@ export class Runner {
       delete rec.moved;
     }
     // Kept for the next message when this one is a command, as the news is.
-    if (command) rt.session!.send({ id: msg.turnId, text, images: msg.images });
-    else this.sendWithInstructionsNews(st, { id: msg.turnId, text, images: msg.images });
+    if (rt.turn) rt.turn.dispatched = true;
+    if (command) rt.session!.send({ ...input, text });
+    else this.sendWithInstructionsNews(st, { ...input, text });
     if (msg.reviewId && !rec.reviewDeliveries?.includes(msg.reviewId)) {
       (rec.reviewDeliveries ??= []).push(msg.reviewId);
       // A persisted transcript row is not proof of dispatch: both initial
@@ -2031,7 +2137,22 @@ export class Runner {
 
   onOutput(st: ThreadState, o: AdapterOutput): void {
     const { rec, rt } = st;
+    if (rt.turn?.dispatched && !rt.closing && !rt.turn.foreignOutput && ((o.kind === 'delta' && o.delta.text.length > 0) ||
+      (o.kind === 'event' && ['assistant.text', 'reasoning', 'tool.call', 'tool.result', 'edit.diff', 'image'].includes(o.event.type)))) {
+      rt.turn.modelOutput = true;
+    }
     switch (o.kind) {
+      case 'messageState': {
+        const turn = rt.turn;
+        if (!turn?.inputs?.has(o.id)) break;
+        turn.deliveryKnown = true;
+        if (o.state === 'started') {
+          (turn.startedMessages ??= new Set()).add(o.id);
+          turn.foreignOutput = false;
+          if (turn.recoveryInput === o.id) this.settleInterruptedMessages(st);
+        } else if (o.state === 'cancelled') (turn.cancelledMessages ??= new Set()).add(o.id);
+        break;
+      }
       case 'event': {
         let ev = o.event;
         if (rt.turn) this.seeWake(rt.turn, ev);
@@ -2241,6 +2362,7 @@ export class Runner {
         break;
       }
       case 'cliTurn':
+        if (rt.turn) rt.turn.foreignOutput = true;
         // The CLI started a turn of its own. Give it a turn in the thread so
         // its output isn't loose, the status says running, and the app
         // flags it when it ends. A message the runner already sent waits
@@ -2334,6 +2456,17 @@ export class Runner {
         const r = o.result;
         const turn = rt.turn;
         if (!turn) break;
+        // A folded-in message may have no started frame of its own. The
+        // result's explicit receipts still mean the CLI took that input.
+        if (!r.own && turn.deliveryKnown) {
+          for (const id of r.answered ?? (r.answers ? [r.answers] : [])) {
+            if (r.unreceived?.includes(id)) continue;
+            (turn.startedMessages ??= new Set()).add(id);
+            if (turn.recoveryInput === id) this.settleInterruptedMessages(st);
+          }
+        }
+        this.saveInterruptedMessages(st, r);
+        if (!r.own && !turn.deliveryKnown && !r.unreceived?.includes(turn.recoveryInput ?? '') && ((!turn.interruptRequested && r.outcome === 'completed') || turn.modelOutput || (r.usage && Object.values(r.usage).some(n => typeof n === 'number' && n > 0)))) this.settleInterruptedMessages(st);
         // Which of this turn's messages the CLI's turn answered. The CLI
         // lists them in sending order, so everything up to the last one
         // named went with it. A CLI without lifecycle frames can only say
@@ -2346,8 +2479,9 @@ export class Runner {
           // The CLI has nothing left to run, so a message sent during the
           // turn went nowhere (an error ended its queue). Say so rather than
           // wait for an answer that won't come.
+          const unsaved = turn.messages.some(id => !turn.startedMessages?.has(id) && !rec.interruptedMessages?.includes(turn.inputs?.get(id) ?? -1));
           turn.messages = [];
-          this.emit(st, { type: 'system.note', text: 'A message sent during this turn was dropped by the CLI. Send it again.' }, turn.turnId);
+          if (!turn.interruptRequested || unsaved) this.emit(st, { type: 'system.note', text: 'A message sent during this turn was dropped by the CLI. Send it again.' }, turn.turnId);
         }
         // Still something to answer: a turn the CLI ran by itself while
         // this thread's message waited in its queue, or a message sent
@@ -2452,7 +2586,6 @@ export class Runner {
     // What it needs from Mike: its end_turn call, else its closing "What I
     // need from you". Only a turn it finished; a stopped one says nothing.
     const said = outcome === 'completed' ? turnNeeds(turn) : undefined;
-    if (said?.asks) said.asks = this.armRunAsks(st, said.asks, turn.turnId);
     if (said) {
       body.needs = said.needs;
       if (said.asks) body.asks = said.asks;
@@ -2663,6 +2796,7 @@ export class Runner {
     const { rec, rt } = st;
     const turn = rt.turn;
     if (!turn) return;
+    this.saveInterruptedMessages(st);
     this.settleInstructionsNews(st, false);
     this.persistInProgress(st, turn.turnId);
     this.expireApprovals(st, 'The turn ended.');
@@ -2791,26 +2925,41 @@ export class Runner {
             // transcript carried to a new folder that wouldn't resume gets
             // the move's note, any other thread with earlier turns the
             // not-found one.
-            let text = this.forAgent(first);
+            turn.deliveryKnown = false;
+            turn.startedMessages = undefined;
+            turn.foreignOutput = false;
+            const input = this.withInterruptedMessages(st, { turnId: turn.turnId, text: first.text, images: first.images, origin: first.origin }, this.forAgent(first));
+            const command = this.commandPlan(st, first.text);
+            let text = command ? first.text : input.text;
             // What it was told of presses went with the session that's gone:
             // a new one hears all it was told, the old one going on only this
             // turn's (Codex's second look).
             const pressed = this.toldPressNews(rec, inUse ? 'turn' : 'all');
-            if (pressed) text = `${pressed}\n\n${text}`;
+            if (pressed && !command) text = `${pressed}\n\n${text}`;
             const earlier = rec.lastTurnCompletedSeq > 0;
-            if (!inUse && (rt.carried || earlier)) {
+            if (!inUse && (rt.carried || earlier) && !(command && /^\/clear\b/i.test(first.text.trim()))) {
               rec.handoff = rt.carried ?? { fromCwd: rec.cwd, fromAccountId: rec.accountId, lost: true };
-              text = this.handoffNote(st, account) + text;
-              delete rec.handoff;
+              if (command) {
+                // The command must stay bare. Keep the missing session's
+                // context for the next ordinary send, rather than lose it.
+                rec.handoff.lost = true;
+                this.retellPressesFrom(rec, 0, true);
+              } else {
+                text = this.handoffNote(st, account) + text;
+                delete rec.handoff;
+              }
             }
             rt.carried = undefined;
             this.startSession(st, account);
-            rt.session!.send({ id: turn.turnId, text, images: first.images });
+            rt.session!.send({ ...input, text });
             // Messages sent into the turn before the CLI went go again, in
             // order, matched to their ids when the counts agree.
             if (msgs.length === turn.messages.length) {
               msgs.slice(1).forEach((m, i) => {
-                if (m.type === 'user.message') rt.session!.send({ id: turn.messages[i + 1], text: this.forAgent(m), images: m.images });
+                if (m.type === 'user.message') {
+                  const input = this.withInterruptedMessages(st, { turnId: turn.messages[i + 1], text: m.text, images: m.images, origin: m.origin }, this.forAgent(m));
+                  rt.session!.send(input);
+                }
               });
             }
             return;
@@ -3371,6 +3520,86 @@ export class Runner {
   }
 
   // ----------------------------------------------------------------- snooze
+
+  // A zero-token interrupted result is not a receipt. Keep the original
+  // log rows so their pictures and origin survive without duplicate user rows.
+  saveInterruptedMessages(st: ThreadState, result?: TurnResult): void {
+    const { rec, rt } = st;
+    const turn = rt.turn;
+    if (!turn?.interruptRequested || turn.local || rt.editing) return;
+    const unreceived = new Set(result?.unreceived);
+    const usage = result?.own ? undefined : result?.usage;
+    const zero = usage?.inputTokens === 0 && usage.outputTokens === 0 &&
+      !Object.values(usage).some(n => typeof n === 'number' && n > 0);
+    if (!unreceived.size && !turn.deliveryKnown && (turn.modelOutput || (usage && !zero) || (!zero && rt.started && turn.dispatched))) return;
+    const ids = new Set(rec.interruptedMessages);
+    const before = ids.size;
+    for (const [id, seq] of turn.inputs ?? []) {
+      if (unreceived.size && !unreceived.has(id)) continue;
+      if (!unreceived.has(id) && (turn.startedMessages?.has(id) || (turn.deliveryKnown && !turn.cancelledMessages?.has(id) && (turn.modelOutput || (usage && !zero))))) continue;
+      const e = this.store.log(rec.id).read(seq, seq)[0];
+      if (e?.type === 'user.message' && fromMike(e.text, e) && !this.commandPlan(st, e.text) && !cutOut(rec, seq)) ids.add(seq);
+    }
+    if (ids.size === before) return;
+    rec.interruptedMessages = [...ids];
+    this.emit(st, { type: 'system.note', savedMessage: true, text: 'Your stopped message and pictures are saved for your next message.' }, turn.turnId);
+    this.markDirty(st);
+  }
+
+  settleInterruptedMessages(st: ThreadState): void {
+    const recovered = st.rt.turn?.recoveredMessages;
+    if (!recovered?.length) return;
+    st.rec.interruptedMessages = st.rec.interruptedMessages?.filter(id => !recovered.includes(id));
+    if (!st.rec.interruptedMessages?.length) delete st.rec.interruptedMessages;
+    st.rt.turn!.recoveredMessages = undefined;
+    st.rt.turn!.recoveryInput = undefined;
+    this.markDirty(st);
+  }
+
+  withInterruptedMessages(st: ThreadState, msg: QueuedSend, text: string): UserInput {
+    const { rec, rt } = st;
+    if (!rec.interruptedMessages?.length || !fromMike(msg.text, msg) || this.commandPlan(st, msg.text) || (rt.turn?.recoveryInput && rt.turn.recoveryInput !== msg.turnId)) return { id: msg.turnId, text, images: msg.images };
+    const saved = [...new Set(rec.interruptedMessages)].filter(seq => Number.isSafeInteger(seq) && seq > 0 && seq <= rec.lastSeq).sort((a, b) => a - b).flatMap(seq => this.store.log(rec.id).read(seq, seq)).filter(e => e.type === 'user.message' && fromMike(e.text, e) && !this.commandPlan(st, e.text) && !cutOut(rec, e.seq));
+    const images: ImageRef[] = [];
+    const parts: string[] = [];
+    let media: string | undefined;
+    try { media = fs.realpathSync(this.store.mediaDir(rec.id)); } catch { /* Pictures may have been cleaned up. */ }
+    const append = (words: string, refs: ImageRef[]) => {
+      const numbers = refs.map(ref => {
+        try {
+          const file = fs.realpathSync(ref.path);
+          if (!media || path.dirname(file) !== media || !fs.statSync(file).isFile()) return undefined;
+          images.push({ ...ref, path: file });
+          return images.length;
+        } catch { return undefined; }
+      });
+      // Give unplaced pictures a marker too, so combining messages doesn't
+      // move a later message's picture ahead of the earlier one's words.
+      const placed = new Set([...words.matchAll(/\[Picture (\d{1,3})\]/g)].map(m => Number(m[1])));
+      const marker = (n: number) => numbers[n - 1] ? `[Picture ${numbers[n - 1]}]` : `[Picture ${n} unavailable]`;
+      const unplaced = refs.flatMap((_, i) => placed.has(i + 1) ? [] : [marker(i + 1)]);
+      const shifted = words.replace(/\[Picture (\d{1,3})\]/g, (_, n) => marker(Number(n)));
+      parts.push([...unplaced, shifted].join('\n'));
+    };
+    for (const e of saved) if (e.type === 'user.message') append(this.forAgent(e), e.images ?? []);
+    if (!saved.length) {
+      delete rec.interruptedMessages;
+      return { id: msg.turnId, text, images: msg.images };
+    }
+    parts.push('[Latest message. Follow any corrections or cancellation here over the earlier requests.]');
+    append(text, msg.images);
+    if (rt.turn) {
+      rt.turn.recoveredMessages = saved.map(e => e.seq);
+      rt.turn.recoveryInput = msg.turnId;
+      const seq = rt.turn.inputs?.get(msg.turnId);
+      if (seq !== undefined) {
+        const recoveries = rec.messageRecoveries ??= [];
+        if (!recoveries.some(r => r.seq === seq)) recoveries.push({ seq, messages: [...rt.turn.recoveredMessages] });
+        this.markDirty(st);
+      }
+    }
+    return { id: msg.turnId, text: '[Earlier messages stopped before a reply. Answer them along with the latest message below.]\n\n' + parts.join('\n\n'), images };
+  }
 
   // Takes back a queued message that hasn't started: the runner's own,
   // gone stale before its turn came (fix-update.ts). Whether it was there.
@@ -4011,7 +4240,14 @@ export function stoppedWorkMessage(what: string[], last: boolean): string {
   ].join('\n');
 }
 
-export type SendOptions = { origin?: MessageOrigin; scheduleId?: string; queue?: boolean; answers?: AskAnswer[]; editOf?: number };
+export type SendOptions = { origin?: MessageOrigin; scheduleId?: string; queue?: boolean; answers?: AskAnswer[]; editOf?: number; messageId?: string; scheduledSince?: number };
+
+// A UUID-shaped id in the existing message/turn field, so it survives every
+// runner handover and crash without adding metadata for clients to mirror.
+function scheduledMessageId(threadId: string, scheduleId: string, run: string): string {
+  const hex = crypto.createHash('sha256').update(JSON.stringify([threadId, scheduleId, run])).digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
 
 // Typed by Mike, at the Mac or on his phone: not the runner's, a
 // schedule's or an agent's (another thread's, or this one's own `then`

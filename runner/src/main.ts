@@ -14,7 +14,7 @@ import { startHousekeeping } from './housekeeping.ts';
 import { RELEASE, markConfigStop, markGoodLater, onSupervisorGone, ownCheckout, readRelease, readState, requestHandover, supervised, takeRollbackNotice, tellLaunchListening } from './release.ts';
 import { PatchTrust } from './patch-trust.ts';
 import type { RunnerUpdates } from './runner.ts';
-import { Peers, PrimaryLink, ThreadRouter, drainChildrenName, peersElsewhere, phoneCommands, primaryElsewhere, primaryRemote, projectRouter, removeDrainInfo, scheduleRouter, writeDrainInfo, type CrossRunnerHooks, type Elsewhere } from './handover.ts';
+import { scheduledSendMethods, sendScheduled, Peers, PrimaryLink, ThreadRouter, drainChildrenName, peersElsewhere, phoneCommands, primaryElsewhere, primaryRemote, projectRouter, removeDrainInfo, scheduleRouter, writeDrainInfo, type CrossRunnerHooks, type Elsewhere } from './handover.ts';
 import { RunnerUpdater, releaseTreeAt } from './update.ts';
 import { RELEASE_NOTES_SYSTEM, SETTLE_MS, Upstream } from './upstream.ts';
 import { BringIn } from './bring-in.ts';
@@ -29,6 +29,7 @@ import { StuckJobs } from './stuck-jobs.ts';
 import { FrozenClis } from './frozen-cli.ts';
 import { KeepAwake } from './keep-awake.ts';
 import { experimentOn } from './experiments.ts';
+import { Reinstaller } from './reinstall.ts';
 import { MacScreen } from './mac-screen.ts';
 import { Projects, drainProjectMethods, projectMethods } from './projects.ts';
 import { Librarian, librarianMethods } from './librarian.ts';
@@ -42,7 +43,7 @@ import { ClaudeAdapter } from './adapters/claude/adapter.ts';
 import { ProcessRegistry } from './proc.ts';
 import { Runner } from './runner.ts';
 import { startOwnThread } from './own-threads.ts';
-import { askBrief, ConvexUseTally, FullSyncOffer, fullSyncReason } from './convex-use.ts';
+import { askBrief, ConvexUseTally, FullSyncOffer, fullSyncAnswerer, fullSyncQuestion, fullSyncReason } from './convex-use.ts';
 // How long after starting the runner looks for a reason to ask about full sync,
 // and how long after a pairing or a new machine it asks (convex-use.ts).
 const ASK_FULL_SYNC_AFTER_MS = 5 * 60_000;
@@ -265,14 +266,14 @@ async function main(): Promise<void> {
     claudePath: cfg.claudePath,
     registry,
     log,
-    mcpServersFor: (threadId) => ({ [SERVER_NAME]: threadbearMcpServer(router(), threadId, scheduleControl(), projectControl(), appRestarts, () => cfg.bulletReplies, pocketControl, () => cfg.oneReply, () => cfg.connectorsUrl, gatewayHealth, remoteControl, () => experimentOn(cfg.home, 'runAsks')) }),
+    mcpServersFor: (threadId) => ({ [SERVER_NAME]: threadbearMcpServer(router(), threadId, scheduleControl(), projectControl(), appRestarts, () => cfg.bulletReplies, pocketControl, () => cfg.oneReply, () => cfg.connectorsUrl, gatewayHealth, remoteControl) }),
     oneReply: () => cfg.oneReply,
     sandboxFor: (cwd) => sandboxFor(cfg.sandbox, cwd),
     alwaysAsk: ALWAYS_ASK_TOOLS,
     neverAsk: NEVER_ASK_TOOLS,
   });
   // The threadbear tools for an agent that isn't given them in-process.
-  const codexStyleTools = (threadId: string) => buildThreadbearTools(router(), threadId, Date.now, scheduleControl(), projectControl(), appRestarts, { provider: 'codex', bulletReplies: () => cfg.bulletReplies, oneReply: () => cfg.oneReply, pocket: pocketControl, gateway: () => cfg.connectorsUrl, gatewayHealth, remote: remoteControl, runAsks: () => experimentOn(cfg.home, 'runAsks') });
+  const codexStyleTools = (threadId: string) => buildThreadbearTools(router(), threadId, Date.now, scheduleControl(), projectControl(), appRestarts, { provider: 'codex', bulletReplies: () => cfg.bulletReplies, oneReply: () => cfg.oneReply, pocket: pocketControl, gateway: () => cfg.connectorsUrl, gatewayHealth, remote: remoteControl });
   // One app-server per live Codex thread, each starting what E says is
   // current, with the same threadbear tools as dynamic tools.
   const codex = new CodexAdapter({
@@ -318,6 +319,15 @@ async function main(): Promise<void> {
   const instructions = new InstructionsStore({ home: cfg.home, token, publish: (n) => runner.publish(n) });
   runner = new Runner({
     threadKey: (id) => makeThreadKey(token, id),
+    // Mike's pick on the full sync question's card sets it, once: the asking
+    // thread's agent can't (Daybreak 121, convex-use.ts fullSyncAnswer).
+    answered: fullSyncAnswerer({
+      asked: () => {
+        const s = readRunnerJson(cfg.home).sync;
+        return { thread: s?.fullAskedThread, question: s?.fullAskedQuestion };
+      },
+      set: (on) => void settings.update({ fullSync: on }),
+    }),
     standingInstructions: () => instructions.given(),
     projects,
     atMac: () => atMac,
@@ -408,7 +418,9 @@ async function main(): Promise<void> {
     home: cfg.home,
     clock: realClock,
     log,
-    elsewhere: (id) => peers.owns(id),
+    elsewhere: (id) => peers.owns(id) || peers.isArriving(id),
+    folderElsewhere: (id) => peers.find(id)?.cwd,
+    sendElsewhere: (id, text, scheduleId, run, since) => sendScheduled(runner, peers, id, text, scheduleId, run, since),
     self: { id: syncRunnerId, name: cfg.sync.name ?? defaultRunnerName(), icon: runnerIcon, version: RUNNER_VERSION, release: RELEASE.release, startedAt },
     syncOn: Boolean(cfg.sync.enabled && cfg.sync.url && readSyncKey(cfg.home)),
   });
@@ -682,6 +694,27 @@ async function main(): Promise<void> {
     restart: (p) => restarter.request({ when: 'idle', ...p }),
     pendingRestart: () => Boolean(restarter.status().pendingRestart),
     followsOrigin: () => followOriginOn(cfg.home),
+    onChange: () => {
+      // updaterReady: the first onChange can come before the reinstaller exists.
+      if (updaterReady) reinstaller.consider();
+      publishUpdates();
+    },
+  });
+  // The LaunchAgent reinstalling itself when it's behind main (reinstall.ts):
+  // the Updates panel's Reinstall now, or by itself with selfReinstall on.
+  const reinstaller = new Reinstaller({
+    home: cfg.home,
+    checkout: updateRelease?.checkout,
+    clock: realClock,
+    log,
+    behind: () => {
+      const u = updater.status();
+      return u.launcherChanged && u.launcherReason && u.launcherKey ? { reason: u.launcherReason, key: u.launcherKey } : undefined;
+    },
+    // As a restart would wait: no busy thread, no old runner still finishing
+    // turns, and no restart of its own on the way (it would race the reinstall).
+    idle: () => !draining && restarter.busyThreads().length === 0 && peers.status().length === 0 && !restarter.status().pendingRestart,
+    auto: () => experimentOn(cfg.home, 'selfReinstall'),
     onChange: () => publishUpdates(),
   });
   // Mike's releases for a fork, and on Mike's own runner the tagging of
@@ -706,6 +739,9 @@ async function main(): Promise<void> {
   // when it would help: a phone or browser paired, or another machine here
   // (convex-use.ts FullSyncOffer). An install with sync.full set either way is
   // never asked. Noted in runner.json once the thread is open, so it's once.
+  // The question the asking thread was given, noted with its id: Mike's
+  // pick counts only on a card that asks exactly that (fullSyncAnswer).
+  let fullSyncQuestionAsked: string | undefined;
   const fullSyncOffer = new FullSyncOffer({
     read: () => {
       const j = readRunnerJson(cfg.home);
@@ -715,12 +751,14 @@ async function main(): Promise<void> {
       // The checkout's tb, as this release's folder is pruned after a few more.
       const tbPath = thisRelease?.checkout ? path.join(thisRelease.checkout, 'runner', 'bin', 'tb') : path.join(import.meta.dirname, '..', 'bin', 'tb');
       const tb = `'${tbPath.replace(/'/g, `'\\''`)}'`;
-      return startOwnThread(runner, askBrief(tb, reason, process.platform === 'darwin' ? 'Mac' : 'machine'), thisRelease?.checkout);
+      const machine = process.platform === 'darwin' ? 'Mac' : 'machine';
+      fullSyncQuestionAsked = fullSyncQuestion(reason, machine);
+      return startOwnThread(runner, askBrief(tb, reason, machine), thisRelease?.checkout);
     },
     note: (threadId, clear) => {
       const json = readRunnerJson(cfg.home);
-      const { fullAsked: _a, fullAskedThread: _t, ...rest } = json.sync ?? {};
-      json.sync = clear ? rest : { ...rest, fullAsked: new Date().toISOString(), ...(threadId ? { fullAskedThread: threadId } : {}) };
+      const { fullAsked: _a, fullAskedThread: _t, fullAskedQuestion: _q, ...rest } = json.sync ?? {};
+      json.sync = clear ? rest : { ...rest, fullAsked: new Date().toISOString(), ...(threadId ? { fullAskedThread: threadId, ...(fullSyncQuestionAsked ? { fullAskedQuestion: fullSyncQuestionAsked } : {}) } : {}) };
       writeRunnerJson(cfg.home, json);
     },
     later: (fn, ms) => void setTimeout(fn, ms).unref?.(),
@@ -806,6 +844,9 @@ async function main(): Promise<void> {
     if (u.reason) out.reason = u.reason;
     if (u.launcherChanged) out.launcherChanged = true;
     if (u.launcherReason) out.launcherReason = u.launcherReason;
+    if (u.checkout) out.checkout = u.checkout;
+    const reinstall = reinstaller.status();
+    if (reinstall) out.reinstall = reinstall;
     if (u.followProblem) out.followProblem = u.followProblem;
     const webRuntimeProblem = webRuntimeUpdates.problem();
     if (webRuntimeProblem) out.webRuntimeProblem = webRuntimeProblem;
@@ -840,6 +881,8 @@ async function main(): Promise<void> {
   };
   // tb updates (docs/protocol.md, "Mike's releases").
   methods['upstream.status'] = () => ({ upstream: upstream.status() });
+  // The Updates panel's Reinstall now (docs/protocol.md, "Runner updates").
+  methods['runner.reinstall'] = () => ({ reinstall: reinstaller.request() ?? null });
   // Other runners' threads, for the Mac app's sidebar (step 6 part 2).
   // `forTools`: a draining runner's agent tools (handover.ts primaryRemote),
   // given what this runner's own tools get, the wait for the rows included.
@@ -1110,12 +1153,16 @@ async function main(): Promise<void> {
     port: cfg.port,
     token,
     runner,
+    relayMoving: (id) => {
+      const m = remoteMoving.get(id);
+      return Boolean(m && m.until >= Date.now() && m.moving.state !== 'failed' && m.moving.state !== 'cancelled');
+    },
     log,
     clis: updates,
     methods,
     remote: peers,
     relay,
-    gate: new CallerGate({ runner, remote: peers, schedules: scheduler, fullSyncAskThread: () => readRunnerJson(cfg.home).sync?.fullAskedThread }),
+    gate: new CallerGate({ runner, remote: peers, schedules: scheduler }),
     callerOfPort: (port) => threadOfPort(port, { registry, known: (id) => runner.has(id) || peers.owns(id), log }),
     updates: () => (draining ? undefined : runnerUpdates()),
     appHello: (build, app) => appRestarts.appHello(build, app),
@@ -1174,6 +1221,7 @@ async function main(): Promise<void> {
   const cancelMarkGood = markGoodLater(cfg.home, RELEASE.release, log, process.env, () => {
     restarter.proven();
     updater.start();
+    reinstaller.consider();
     upstream.start();
     swiftChanges.start();
   });
@@ -1205,6 +1253,7 @@ async function main(): Promise<void> {
     stopping = true;
     cancelMarkGood();
     updater.stop();
+    reinstaller.stop();
     upstream.stop();
     swiftChanges.stop();
     stopHousekeeping();
@@ -1268,6 +1317,7 @@ async function main(): Promise<void> {
     try {
       cancelMarkGood();
       updater.stop();
+      reinstaller.stop();
       upstream.stop();
       swiftChanges.stop();
       stopHousekeeping();
@@ -1320,6 +1370,7 @@ async function main(): Promise<void> {
         gate: new CallerGate({ runner, schedules: scheduler }),
         callerOfPort: (port) => threadOfPort(port, { registry, known: (id) => runner.has(id), log }),
         methods: {
+          ...scheduledSendMethods(runner),
           'drain.hello': () => {
             primaryHeard = true;
             // After this answer, so the primary has subscribed first.

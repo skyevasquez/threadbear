@@ -103,6 +103,15 @@ File references are where to look.
   `~/.config/systemd/user/com.mikerosoft.threadbear.runner.service`, and no
   apps; it converts pictures with ImageMagick and rsvg-convert, and reads
   the account's full name from `getent passwd` rather than `id -F`.
+- **A one-shot reinstall job:** when the runner's LaunchAgent or
+  Threadbear Runner.app is behind main and you press Reinstall now in the
+  Updates panel (or the `selfReinstall` experiment is on), the runner
+  writes `<data folder>/runner/reinstall/<label>.reinstall.plist` and
+  loads it with `launchctl bootstrap` (it isn't in `~/Library/LaunchAgents`,
+  so it never starts at login). It runs `runner/scripts/install-runner.sh`
+  from your clone once, logging to `<data folder>/runner/reinstall.log`,
+  and is left loaded but stopped until the next one replaces it. On Linux
+  it's a transient `systemd-run --user` unit instead (`runner/src/reinstall.ts`).
 - **Commands:** `~/.local/bin/threadbear`, a link into your clone, and
   `~/.local/bin/tb`, a three-line script that runs the `tb` of the runner
   release this Mac runs (`runner/scripts/link-tb.sh`; it leaves a `tb` that
@@ -163,7 +172,7 @@ File references are where to look.
   clone that takes no space where the disk can make one, cleared after a
   day);
   `~/Library/Caches/Threadbear/previews` (private, read-only snapshots of
-  Office and iWork documents, so Quick Look reads the file the open gate
+  Office and iWork documents and PDF link hovers, so Quick Look reads the file the open gate
   checked; removed after the thumbnail is made, with interrupted copies
   cleared after a day when another preview is made);
   `~/Library/Caches/Threadbear/rich` (pictures of the ```` ```mermaid ```` and
@@ -291,12 +300,44 @@ File references are where to look.
   `~/.cache/threadbear-check/gpui` and copies the two binaries back with scp
   (`desktop/scripts/remote.sh`). Remote commands and performance tools keep
   `~/.cache/threadbear-perf.lock` and `~/.cache/threadbear-check/lock` on the
-  host while they run, waiting for other builds, checks and measurements.
+  host while they run, waiting for other builds, checks and measurements,
+  with a note beside the first (`threadbear-perf.lock.holder`: its pid, when
+  it took the lock and what it's running) so a waiting run can say who it's
+  waiting for. The holder deletes it when it finishes. Each waiting run keeps
+  a file in `threadbear-perf.lock.waiting` until it gets the lock, so the
+  others can say how many are queued ahead.
   Temporary wrappers under the run's temp folder background Cargo and Swift
   builds and are removed when the run ends. Performance runs register their
   process groups and start times in `~/.cache/threadbear-check/perf-children-*`
-  until cleanup has stopped them. A cleanup still blocked after 30 seconds
-  records its process-group IDs in `~/.cache/threadbear-check/perf-cleanup.log`
+  until cleanup has stopped them. Registered processes also inherit an unlocked
+  descriptor (197) for the registry's state file. Cleanup matches its device
+  and inode through `lsof` on macOS or `/proc` on Linux to find terminal shells
+  that outlived their app. It reads descriptor metadata, not process environments;
+  command-line text does not count as ownership. Cleanup checks
+  start times before signalling those processes and follows live ancestry for
+  children that closed the descriptor. It repeats discovery until the lease's work
+  stops, retaining both locks. A small sleeping process stays in each active
+  group, keeping that group ID reserved even after its original
+  process dies. Its PID and start time are recorded in `anchor-*` files in the
+  same registry. It double-forks outside the worker's tree, holds no host lock
+  or output pipe, and exits once its leader is gone and two snapshots find it
+  alone. Before exiting it renames its record to `retired-*` under the
+  registration gate, so reuse of that group number cannot block cleanup.
+  Retirement records include the original leader start time; a new registration
+  clears stale retirement and reuses an existing live holder when possible.
+  It checks once a second, checking group membership every two seconds after the leader goes. It also exits if the reaper dies, with
+  a start-time check every 30 seconds.
+  Only a live matching anchor permits the final group kill; separate sessions
+  need their descriptor or captured ancestry. The macOS descriptor probe avoids
+  filesystem stats and has a two-second timeout. A failed probe still allows
+  registered work to stop but prevents unlocking. Same-user processes that
+  hide their descriptors cannot be attributed after losing their ancestry.
+  Every descriptor scan must also find the reaper's own close-on-exec control
+  descriptor before it can declare cleanup complete. If an anchor disappears
+  while its group is still active, cleanup keeps the locks rather than guess
+  who owns that group.
+  A cleanup still blocked after 30 seconds
+  records its process IDs in `~/.cache/threadbear-check/perf-cleanup.log`
   and keeps the locks until the work stops. With `remote.sh --perf`, the shared warm
   target is `~/.cache/threadbear-check/gpui/perf-target`, kept out of ordinary
   cache eviction; other builds keep their own target. Source/target `.in-use`
@@ -311,7 +352,11 @@ File references are where to look.
   Terminal shell running something, a web panel used in the last minute):
   straight away while you're in another app, and with the app in front
   once you haven't touched the Mac for five seconds (it asks macOS how
-  long since the last key, click or pointer move, nothing more). It writes what it did and the build's output to
+  long since the last key, click or pointer move, nothing more). With its
+  window on screen the restart is a handover: the new app is opened beside
+  the old one (`open -n`), and the two pass three small files (ready, go,
+  done) through a folder named for the old app's process,
+  `$TMPDIR/threadbear-handover-<pid>`, deleted once it's over. It writes what it did and the build's output to
   `~/Library/Logs/threadbear-desktop-update.log` (the one before it in
   `.log.1` once that passes 2 MB). `followMain: false` stops it too.
 - **Following GitHub on a second machine** (`runner/src/follow-origin.ts`):
@@ -574,8 +619,8 @@ show each thread's tool output and diffs, not just its messages, even when the
 machine that ran it is asleep or gone, so it only helps once there's something
 other than this Mac to read them on. The main runner asks once, in a thread of its
 own, when that happens: a phone or the website paired, or another machine added.
-It does what you answer, and never asks again (`tb settings full on|off` sets it any
-time). An install with `sync.full` set either way is never asked or changed; a Linux
+Your pick on its card sets it (the runner does that itself, not the thread's agent),
+and it never asks again (`tb settings full on|off` sets it any time). An install with `sync.full` set either way is never asked or changed; a Linux
 runner has whatever its own `runner.json` says. `"sync": { "full": false }` keeps tool output,
 diffs and tool screenshots on that runner, and then nothing below happens. With it on, from then on (older tools aren't sent), that
 runner also sends each finished tool's output, its full input, its diffs and the

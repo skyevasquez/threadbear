@@ -90,6 +90,8 @@ export type TurnResult = {
   // messages sent close together that ran as one turn, then any folded in
   // while it ran. Absent from CLIs that don't report it (then `answers`).
   answered?: string[];
+  // Cancelled in this adapter's waiting queue, before reaching the CLI.
+  unreceived?: string[];
   // Messages still waiting in the CLI's queue when this result was
   // produced, when the CLI reports it: it runs them next, without being
   // sent anything.
@@ -102,6 +104,9 @@ export type TurnResult = {
 };
 
 export type AdapterOutput =
+  // The CLI's receipt for an input, before it asks the model. Cancelled
+  // without started means the message never became the agent's to read.
+  | { kind: 'messageState'; id: string; state: 'queued' | 'started' | 'cancelled' }
   | { kind: 'event'; event: EventBody }
   | { kind: 'delta'; delta: DeltaBody }
   | { kind: 'session'; nativeSessionId: string; model?: string }

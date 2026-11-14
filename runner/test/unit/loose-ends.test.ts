@@ -12,6 +12,9 @@ import { PATIENCE_MS } from '../helpers/patience.ts';
 import { anyOpen, childLooseEnds, editedLooseEnds, githubRepo, runningLooseEnds, scheduleLooseEnds, worktreeLooseEnds, type Pr, type PrLookup } from '../../src/loose-ends.ts';
 import { droppedOpenLines, needsFromTool } from '../../src/needs.ts';
 import { buildThreadbearTools } from '../../src/threadbear-mcp.ts';
+import { Scrubber } from '../../src/scrub.ts';
+import { useScrubForCuts } from '../../src/safe-cut.ts';
+import { redactSecrets, scrubText } from '../../src/redaction.ts';
 import { EXPERIMENTS } from '../../src/experiments.ts';
 import type { Schedule } from '../../src/protocol.ts';
 import type { WorktreeRecord } from '../../src/worktrees.ts';
@@ -419,4 +422,73 @@ test("looseEnds: a background job still running is on the card, says archiving s
   (h.adapter as { wakesAfterTasks?: boolean }).wakesAfterTasks = false;
   s.out({ kind: 'tasks', tasks: [] });
   await until(() => h.runner.get(id).looseEnds?.ends.length === 0, 'the check after the job ended');
+});
+
+// Daybreak 115 (13 Nov 2026): a Codex job's description is its whole
+// command. Cut at 99 characters with ". Archiving stops it." after, a key
+// the runner knows (one typed on the phone) that crossed the cut went up
+// all but its last character: the scrub knows a cut-off key only at the
+// very end of a text. The line is scrubbed as sync scrubs it (Scrubber.doc).
+test('looseEnds: a running job cut short never sends part of a key the runner knows', () => {
+  const scrubber = new Scrubber({ env: {}, folders: false });
+  const key = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9';
+  const dotted = 'Zq8Wx3Lk9Vm2Pn7Rt4Ys6Hd1Jf5Gc0Bv...';
+  scrubber.known.add(key);
+  scrubber.known.add(dotted);
+  useScrubForCuts((t) => redactSecrets(scrubber.known.mask(t)).text);
+  const leaks = (text: string, secret: string) => {
+    for (let i = 0; i + 8 <= secret.length; i++) if (text.includes(secret.slice(i, i + 8))) return true;
+    return false;
+  };
+  try {
+    const cases = [
+      `curl -H "X-Token: ${'q'.repeat(20)}" ${key} --retry 3`, // the write-up's: 36 before, 8 after
+      `${'x'.repeat(98 - 10)} ${key}`, // key starts just before the cut
+      `${'x'.repeat(40)}\n\t${key}\nmore after the key`, // whitespace closed up first
+      `${'y'.repeat(100 - key.length - 1)} ${key}`, // exactly 100: whole, and masked whole
+      `${'y'.repeat(100 - key.length)}${key}`,
+      `deploy --token ${dotted}`, // a key that ends in dots keeps them
+      `${'z'.repeat(80)} ${dotted}`,
+      `postgres://alice:${'p'.repeat(60)}@db.internal.example/app ${'w'.repeat(20)}`, // shape rules too
+    ];
+    for (const description of cases) {
+      const [end] = runningLooseEnds([{ kind: 'shell', description }]);
+      assert.ok(end.text.endsWith(' Archiving stops it.') || end.text.startsWith('Still running (archiving stops it): '), end.text);
+      const sent = scrubber.doc({ looseEnds: [{ kind: end.kind, text: end.text }] }).looseEnds[0].text;
+      assert.ok(!leaks(sent, key), sent);
+      assert.ok(!leaks(sent, dotted.replace(/\.+$/, '')), sent);
+      assert.ok(!leaks(sent, 'p'.repeat(60)), sent);
+    }
+    // Still cut to about the same length, and plain words are cut where they were.
+    const plain = runningLooseEnds([{ kind: 'shell', description: 'w '.repeat(100) }])[0].text;
+    assert.ok(plain.length < 160, plain);
+    assert.match(plain, /^Still running \(archiving stops it\): (w )+w…$/);
+  } finally {
+    useScrubForCuts(scrubText);
+  }
+  // Codex's review: a key the runner learns of only after the line was made
+  // (a .env still being read when the turn ended). Cut, the line ends with
+  // the cut words, so the scrub's check for a value cut off at the end sees it.
+  const late = new Scrubber({ env: {}, folders: false });
+  const lateKey = 'f0e1d2c3b4a5968778695a4b3c2d1e0ff0e1d2c3b4a5968778695a4b3c2d1e0f';
+  const [made] = runningLooseEnds([{ kind: 'shell', description: `curl -H "X-Token: ${'q'.repeat(20)}" ${lateKey} --retry 3` }]);
+  late.known.add(lateKey);
+  const out = late.doc({ text: made.text }).text;
+  for (let i = 0; i + 8 <= lateKey.length; i++) assert.ok(!out.includes(lateKey.slice(i, i + 8)), out);
+  // Codex's second review. A key ending in dots, learned later, in a short
+  // line: whole, so the whole-value match still finds it.
+  const dots = new Scrubber({ env: {}, folders: false });
+  const dotKey = 'Zq8Wx3Lk9Vm2Pn7Rt4Ys6Hd1Jf5Gc0Bv...';
+  const [short] = runningLooseEnds([{ kind: 'shell', description: `deploy --token ${dotKey}` }]);
+  assert.equal(short.text, `Still running: deploy --token ${dotKey} Archiving stops it.`);
+  dots.known.add(dotKey);
+  assert.ok(!dots.doc({ t: short.text }).t.includes('Zq8Wx3Lk'), dots.doc({ t: short.text }).t);
+  // Two late values, one the start of the other, the longer cut off.
+  const both = new Scrubber({ env: {}, folders: false });
+  const longKey = 'kP3vN8qR2xL7mT4wZ9bH6cJ1fD5gS0aYkP3vN8qR2xL7mT4wZ9bH6cJ1fD5gS0aY';
+  const [cut] = runningLooseEnds([{ kind: 'shell', description: `${'r'.repeat(39)} ${longKey} --and-more` }]);
+  both.known.add(longKey);
+  both.known.add(longKey.slice(0, 20));
+  const sentBoth = both.doc({ t: cut.text }).t;
+  for (let i = 0; i + 8 <= longKey.length; i++) assert.ok(!sentBoth.includes(longKey.slice(i, i + 8)), sentBoth);
 });

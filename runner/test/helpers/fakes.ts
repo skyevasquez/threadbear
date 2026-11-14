@@ -1,3 +1,4 @@
+import './clean-env.ts';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -161,6 +162,8 @@ export function testConfig(home: string, extra: Partial<Config> = {}): Config {
   fs.mkdirSync(cwd, { recursive: true });
   return {
     home,
+    userHome: home,
+    pathEnv: '',
     port: 0,
     host: '127.0.0.1',
     logFile: path.join(home, 'runner.log'),
@@ -279,7 +282,9 @@ export function makeHarness(home = tmpDir(), cfgExtra: Partial<Config> = {}, dep
     // would run its live commands (gh and the like) in every test's runner.
     // Tyler Lusk's fork found it: a Mac with a few home patches took over 40
     // minutes on the quick check and failed its timing tests (9 Nov 2026).
-    panelsRoot: tmpDir(),
+    // The preload makes HOME private, and all fixture temps live under it.
+    // A sibling temp root would make ancestor scans walk past HOME.
+    panelsRoot: os.homedir(),
     // Never touch a real Claude config dir from a test.
     copyTranscript: () => false,
     subagentTranscript: () => null,

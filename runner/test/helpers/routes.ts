@@ -28,7 +28,7 @@ const RUNNER = 'bruce0000001';
 const END_TURN = 'mcp__threadbear__end_turn';
 
 // What a person sees of a thread, on any of the three: its card and its messages.
-export type Ask = { action: string; options?: string[]; optionNotes?: string[]; suggested?: number; links?: { title: string; url: string }[]; run?: { command: string; buttonId?: string; cwd?: string } };
+export type Ask = { action: string; options?: string[]; optionNotes?: string[]; suggested?: number; links?: { title: string; url: string }[] };
 export type View = {
   needs?: string;
   asks: Ask[];
@@ -58,8 +58,6 @@ export type Play = {
   send(text: string, images?: ImageRef[]): void;
   /** Mike sends from his phone, so every surface can mark where it came from. */
   sendFromPhone(text: string): void;
-  /** Turns on Run on the card, for the next end_turn. */
-  runAsks(): void;
   /** Mike presses Go ahead on the last plan (plans.approve). */
   approvePlan(): void;
   /** The agent puts a Plan first plan to Mike (plan.proposed). */
@@ -71,6 +69,8 @@ export type Play = {
   reviewed(ledger: LabReviewLedger): void;
   /** The turn fails with this error (a signed-out login, an overloaded API). */
   fail(error: string): void;
+  /** Stop before the model received any tokens. */
+  earlyStop(): void;
   /** The thread's login ran out and the runner moved it to another (runner/pools.ts moveLogin). */
   loginMoved(): void;
 };
@@ -132,7 +132,8 @@ export async function threeWays(play: (p: Play) => void | Promise<void>) {
   };
   const viaPhone = async (): Promise<View> => {
     const r = (await call(b.ctx, mods.phone.thread!, { token: TOKEN, threadId: id })) as { thread: Record<string, any>; messages: { role: 'user' | 'assistant'; text: string; origin?: string }[] };
-    return { needs: r.thread.needs, asks: (r.thread.asks ?? []) as Ask[], next: (r.thread.next ?? []) as string[], looseEnds: ((r.thread.looseEnds ?? []) as { text: string }[]).map((e) => e.text), review: r.thread.review, plans: [], messages: r.messages.map((m) => ({ role: m.role, text: m.text, pictures: 0, ...(m.origin ? { origin: m.origin } : {}) })), notes: [], failed: r.thread.status === 'error' };
+    const page = await call(b.ctx, mods.phone.messages!, { token: TOKEN, threadId: id, notes: true }) as { messages: { role: string; text: string }[] };
+    return { needs: r.thread.needs, asks: (r.thread.asks ?? []) as Ask[], next: (r.thread.next ?? []) as string[], looseEnds: ((r.thread.looseEnds ?? []) as { text: string }[]).map((e) => e.text), review: r.thread.review, plans: [], messages: r.messages.map((m) => ({ role: m.role, text: m.text, pictures: 0, ...(m.origin ? { origin: m.origin } : {}) })), notes: page.messages.filter(m => m.role === 'note').map(m => m.text), failed: r.thread.status === 'error' };
   };
   const views = { here: here(), relay: await viaRelay(), phone: await viaPhone() };
   await sync.stop();
@@ -180,6 +181,10 @@ export async function playInto(post: Post, runner: { key: string; runnerId: stri
         s.result('completed');
       },
       fail: (error) => s.result('failed', undefined, error),
+      earlyStop: () => {
+        h.runner.interrupt(thread.id, { byMike: true });
+        s.result('interrupted', 0, undefined, { usage: { inputTokens: 0, outputTokens: 0 }, queuedTurns: 0 });
+      },
       loginMoved: () => {
         const st = h.runner.threads.get(thread.id)!;
         h.runner.moveLogin(st, { id: 'claude-1', title: 'mike@example.org', provider: 'claude' } as never, 'mike@example.net hit its 5-hour limit, back at 11:30 am');
@@ -194,11 +199,6 @@ export async function playInto(post: Post, runner: { key: string; runnerId: stri
       },
       reviewed: (ledger) => {
         h.runner.threads.get(thread.id)!.rec.labReview = { ...ledger, delivered: ledger.rounds };
-      },
-      runAsks: () => {
-        const file = path.join(h.cfg.home, 'runner.json');
-        const json = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
-        fs.writeFileSync(file, JSON.stringify({ ...json, experiments: { ...json.experiments, runAsks: true } }));
       },
       looseEnds: (checkIn) => {
         const file = path.join(h.cfg.home, 'runner.json');
@@ -241,7 +241,7 @@ function plansOf(events: Record<string, any>[]): string[] {
 
 // A login's notes (system.note with `login`), as their words.
 function loginNotes(events: Record<string, any>[]): string[] {
-  return events.filter((e) => e.type === 'system.note' && e.login === true).map((e) => String(e.text));
+  return events.filter((e) => e.type === 'system.note' && (e.login === true || e.savedMessage === true)).map((e) => String(e.text));
 }
 
 function lastFailed(events: Record<string, any>[]): boolean {

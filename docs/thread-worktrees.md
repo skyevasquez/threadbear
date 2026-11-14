@@ -191,6 +191,16 @@ their own.
   landed; each of the others finds its result in its entry when it gets
   the lock, moves its own branch to its commits as they landed, prints
   them and which branches were in the same check, and exits.
+- The group's check runs in the holder's tb, with its environment, so each
+  entry also keeps the check hosts its own tb asked for
+  (`THREADBEAR_CHECK_HOST`). The check gets them all, the holder's first, as
+  `THREADBEAR_CHECK_PREFER`: `scripts/check-remote.sh` tries those hosts
+  first and keeps the rest of its list behind them, so a landing that asked
+  for the cloud box gets it when it's free, and a group that needs a Mac
+  still goes to one. A group's check (`THREADBEAR_CHECK_GROUP`) always goes
+  to runner.json's hosts, never only the holder's own list, and never to
+  this Mac just because the holder's asked for that. On 13 Nov one that asked for the cloud box was
+  checked on Tinker Desk, behind its long builds, in another's group.
 - An entry is left out, to see to itself later, if it asks for a
   different check (or reads it from another folder), its worktree has
   moved on since it asked, it doesn't go onto the stack cleanly, its tb
@@ -209,8 +219,24 @@ their own.
   for each meant two passing group checks in a row landed nothing.
 - A tb killed during a group check leaves its worktree detached at the
   stack (its branch is untouched) and a marker in the worktree's git dir;
-  the next `tb land` there checks the branch out again. Two `tb land`s in
+  the next `tb land` there checks the branch out again. Commits made on
+  the detached stack meanwhile (a fix committed while the check ran) are
+  first carried onto the branch, as a rebase would, and said; if they
+  don't go on cleanly, `tb land` stops with their ids and how to keep them
+  (`git cherry-pick`), leaving HEAD on them. A running `tb land` does the
+  same when it goes back to the branch, then stops without landing, so the
+  next run lands them too. On 13 Nov a fix committed there was checked out
+  away silently and the same check failed again. Two `tb land`s in
   one worktree take turns (`threadbear-land-worktree.lock` in its git dir).
+- A landing made with `tb land --despite-red` is the repair for what's
+  red, so it's a fix in the queue: it goes first on the stack in every
+  group check, outside the group's limit, and the red hold isn't asked
+  about its files (the others' still are). So a repair queued behind
+  groups failing on main's own error goes into the next check with them,
+  rather than waiting for the halving to finish (13 Nov: three group
+  checks failed on a broken main while its one-line repair waited). If a
+  group with only fixes and the holder fails, the fixes are left out next,
+  so a broken "fix" is still found.
 - If a group's check fails, nothing lands and the group is halved: the
   holder goes again with itself and the first half, and the rest wait with
   their limit halved too. Before retrying, the holder prints the exit code
@@ -219,7 +245,9 @@ their own.
   editing the holder's worktree, which it still uses for retries.
   That is the group's result; an individual landing is
   only refused if its own check fails, so the one that broke it is found
-  in a few checks, and the rest land.
+  in a few checks, and the rest land. Those limits hold only on the main
+  they were set on: once main moves, a failure on the old one says nothing
+  about the new, and they lapse.
 - While it waits, a landing says where it is: whose check is running and
   for how long, how many are waiting ahead of it, and roughly how long it
   has to go, from the last 20 checks in the times log below. If it is

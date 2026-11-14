@@ -322,8 +322,8 @@ if `tb` isn't found (an older runner, or outside a thread), use
 
 - `./check.sh` runs every check (`--quick`: the runner's typecheck and
   unit tests, about a minute, the Mac app's release build when `app/`
-  or `dock/` changed, and the GPUI port's core and client tests when
-  `desktop/` changed, with the full run adding a `cargo check` of the
+  or `dock/` changed, and the GPUI port's core and client tests and a
+  `cargo check` of the GPUI app when `desktop/` changed, with the full run adding a `cargo check` of the
   whole workspace; `--app`: the app's build and tests, for a
   change outside `runner/`). With a check host set it copies the checkout
   there, runs it, brings back failed steps' logs and deletes the copy
@@ -429,9 +429,10 @@ if `tb` isn't found (an older runner, or outside a thread), use
 - The LaunchAgent's program is `~/Applications/Threadbear Runner.app`
   (`runner/launcher/`), a small app that runs `node launch.mjs` so macOS's
   privacy prompts say "Threadbear Runner", not "node". Releases never
-  rebuild it: a change under `runner/launcher/` only ships when Mike runs
-  `install-runner.sh` from a terminal. `tb status` and the app's Updates
-  panel tell him once it's on main, but say so in your end_turn too.
+  rebuild it: a change under `runner/launcher/` only ships through a
+  reinstall. Once it's on main the Updates panel offers Reinstall now (and
+  with the `selfReinstall` experiment the runner does it by itself once no
+  thread is busy, `runner/src/reinstall.ts`); say so in your end_turn too.
 - Never pass `--now`, run `install-runner.sh`, `tb restart` the live runner,
   `launchctl kickstart` it or stop its node process: each ends your own turn
   and stops other threads' work. If one is needed, finish and tell Mike the

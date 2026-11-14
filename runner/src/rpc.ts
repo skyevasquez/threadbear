@@ -14,6 +14,7 @@ import { isMoved, mergeSummaries, type Bucket } from './handover.ts';
 import { AUTH_VERSION, authProof, isNonce, isThreadId, newNonce, proofMatches, threadKey, type AuthChannel } from './rpc-auth.ts';
 import type { CallerGate } from './rpc-gate.ts';
 import { cutSafely } from './safe-cut.ts';
+import { wellFormedJson } from './well-formed-json.ts';
 
 type Conn = {
   id: number;
@@ -105,6 +106,11 @@ export const THREAD_METHODS = new Set([
   'threads.subagent',
 ]);
 
+// Requests that carry Mike's words or pictures to a thread: with a
+// `runnerId`, refused unless they reach the runner the app shows the thread
+// on (docs/protocol.md, threads.send).
+const SHOWN_ON_METHODS = new Set(['threads.send', 'threads.edit']);
+
 // Draining runners' threads, as the primary's server sees them (handover.ts
 // Peers).
 export type RemoteThreads = {
@@ -117,6 +123,8 @@ export type RemoteThreads = {
 // relay.ts's Relay, as the server uses it.
 export type RelayHandler = {
   owns(threadId: string): boolean;
+  /** The runner a relayed request about the thread would reach, if any. */
+  ownerOf?(threadId: string): string | undefined;
   call(threadId: string, method: string, params: Record<string, unknown>): Promise<unknown>;
   create(runnerId: string, params: Record<string, unknown>): Promise<unknown>;
   listFolder(runnerId: string, path: string): Promise<unknown>;
@@ -144,6 +152,10 @@ export type RpcServerOptions = {
   // Other runners' threads, through the backend (relay.ts). Without it, or
   // for a thread it doesn't own, they're unknown here as before.
   relay?: RelayHandler;
+  // Whether this runner knows of a move under way for another runner's
+  // thread (main.ts remoteMoving). A relayed send or edit that doesn't say
+  // which runner it's shown on is refused meanwhile (mustReachShown).
+  relayMoving?: (threadId: string) => boolean;
   // hello's `updates` (docs/protocol.md, "Runner updates").
   updates?: () => unknown;
   // The Mac app's hello with its build (docs/protocol.md, "App restarts").
@@ -387,7 +399,8 @@ export class RpcServer {
       return;
     }
     if (skippable && buffered > (this.opts.skipDeltasBytes ?? SKIP_DELTAS_BYTES)) return;
-    conn.ws.send(msg);
+    // No half emoji: the apps' JSON parsers refuse the message (well-formed-json.ts).
+    conn.ws.send(wellFormedJson(msg));
   }
 
   private broadcast(n: Notification): void {
@@ -523,6 +536,35 @@ export class RpcServer {
     return this.opts.gate.check(conn.caller, method, p);
   }
 
+  /** Throws unless a request about `tid` reaches the runner the client
+   * shows it on, `shown` (null for this Mac's own; undefined when it
+   * doesn't say). */
+  private mustReachShown(tid: string, shown: unknown): void {
+    if (shown === undefined) {
+      // An older client (or tb) doesn't say. It can't have been shown where
+      // a moving thread is, as the apps before this took a move as arrived
+      // the moment its old runner let it go: while one is under way, a
+      // relayed message waits until the move is done (Codex's review).
+      const r = this.opts.runner;
+      if (!r.has(tid) && this.opts.remote?.owns(tid) !== true && this.opts.relay?.owns(tid) && this.opts.relayMoving?.(tid)) {
+        throw new RpcError(ErrorCode.notShownThere, "That thread is moving to another runner, so this wasn't sent. Send it again once it's there.");
+      }
+      return;
+    }
+    if (shown !== null && (typeof shown !== 'string' || !shown)) throw bad('runnerId must be a runner id or null');
+    // A new release taking over this Mac's threads (a handover) is still this Mac.
+    const here = this.opts.runner.has(tid) || this.opts.remote?.owns(tid) === true;
+    const relay = this.opts.relay;
+    const reaches = here ? null : relay?.owns(tid) ? relay.ownerOf?.(tid) ?? '' : undefined;
+    // Nowhere at all: it fails as it would have anyway.
+    if (reaches === undefined) return;
+    if (reaches !== shown) {
+      throw new RpcError(ErrorCode.notShownThere, shown === null
+        ? "That thread isn't on this Mac yet, so this wasn't sent. It's still on the runner it's moving from."
+        : "That thread isn't on the runner it shows, so this wasn't sent. Look again once its move has settled.");
+    }
+  }
+
   private mustClis(method: string): CliControl {
     if (!this.opts.clis) throw new RpcError(ErrorCode.methodNotFound, `Unknown method ${method}`);
     return this.opts.clis;
@@ -539,6 +581,11 @@ export class RpcServer {
       if (!this.appConnected(browser)) return { available: false };
     }
     const tid = typeof p.threadId === 'string' ? p.threadId : undefined;
+    // The app says which runner it shows the thread on; a message or an
+    // edit that would reach another is refused rather than passed on
+    // (Daybreak 113). Only here on the primary: a draining runner answers
+    // -32030 for one it let go, which the primary acts on.
+    if (tid !== undefined && SHOWN_ON_METHODS.has(method) && !this.opts.onlyOwn) this.mustReachShown(tid, p.runnerId);
     if (tid !== undefined && THREAD_METHODS.has(method) && !r.has(tid)) {
       if (this.opts.remote?.owns(tid)) return this.forward(conn, method, p, tid);
       if (this.opts.onlyOwn) throw new RpcError(ErrorCode.moved, 'This runner has handed that thread over to the new one.');

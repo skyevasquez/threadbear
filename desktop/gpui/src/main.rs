@@ -4,6 +4,7 @@
 // channel; requests run there too and their results come back as tasks.
 // Read-outs that exist only for the scripted control (`automation.rs`).
 #![cfg_attr(not(feature = "automation"), allow(dead_code, unused_imports))]
+mod a11y;
 mod activity;
 mod activity_panels;
 mod agent_browser;
@@ -17,7 +18,6 @@ mod app_update;
 mod automation;
 #[cfg(feature = "automation")]
 mod automation_compat;
-mod card_run;
 mod chips;
 mod colour_space;
 mod composer_media;
@@ -39,6 +39,7 @@ mod ding;
 mod draft_boxes;
 mod drafts;
 mod explain_pane;
+mod far_rows;
 mod file_drag;
 mod file_edit;
 mod file_find;
@@ -49,6 +50,7 @@ mod folders;
 #[cfg(feature = "frame-stats")]
 mod frame_stats;
 mod hang_watch;
+mod handover;
 mod input_probe;
 mod header;
 mod highlights;
@@ -226,9 +228,13 @@ fn main() {
     scripted::guard();
     // A build staged while the app last ran, put in place and the new app
     // opened once this one's gone: before anything else (app_update.rs).
-    if app_update::apply_staged_at_launch() {
+    // Not the new copy of a handover: the old one put it in place already,
+    // and is still running from the bundle a swap would clear away.
+    if !handover::window_options_hidden() && app_update::apply_staged_at_launch() {
         std::process::exit(0);
     }
+    // The new copy of a handover says it's started (handover.rs).
+    handover::announce_start();
     // What it was built from, for the runner to tell a thread waiting for
     // the app to restart (docs/protocol.md, "App restarts").
     app_update::announce_build();
@@ -269,7 +275,10 @@ fn main() {
         // Back from an update's restart made while another app was in front:
         // the window comes back behind it, not taking the keys (app_update.rs).
         // A dev-app.sh instance never takes the keys (scripted.rs).
-        let focus = !scripted::keep_behind() && settings.saved.update_restore.as_ref().is_none_or(|r| r["front"].as_bool() != Some(false));
+        // The new copy of a handover opens unseen, under the old window
+        // (handover.rs), and takes the keys only at "go".
+        let hidden = handover::window_options_hidden();
+        let focus = !hidden && !scripted::keep_behind() && settings.saved.update_restore.as_ref().is_none_or(|r| r["front"].as_bool() != Some(false));
         let (window, app) = gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -282,6 +291,7 @@ fn main() {
                 window_min_size: Some(size(px(760.), px(480.))),
                 app_id: Some("threadbear".into()),
                 focus,
+                show: !hidden,
                 ..Default::default()
             },
             cx,
@@ -293,6 +303,9 @@ fn main() {
         window.update(cx, |_, w, cx| window_menu::install(w, cx)).ok();
         if scripted::keep_behind() {
             window.update(cx, |_, w, _| scripted::send_behind(w)).ok();
+        }
+        if hidden {
+            window.update(cx, |_, w, _| handover::conceal(w)).ok();
         }
         deep_links::listen(links, app.downgrade(), window, cx);
         if let Some(note) = brought {

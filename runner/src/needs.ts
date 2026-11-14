@@ -49,19 +49,6 @@ export function endTurnForm(input: unknown): 'oneReply' | 'bullets' | undefined 
   return undefined;
 }
 
-export const MAX_RUN_COMMAND = 8000;
-
-// Why a command can't go on a card, if it can't. What's on the card is what
-// Mike is agreeing to, so it has to be what runs: a control character can
-// redraw what's shown, and invisible or bidi ones can show a different
-// command. ShellBlock.swift holds the Mac's ▶ to the same rule.
-export function runCommandProblem(command: string): string | undefined {
-  if (!command.trim()) return 'run is empty.';
-  if (command.length > MAX_RUN_COMMAND) return `run is over ${MAX_RUN_COMMAND} characters: put it in a script and run that.`;
-  if (/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cs}\p{Cn}]/u.test(command.replace(/[\n\t]/g, ''))) return 'run has control or invisible characters in it, so the card could show something other than what runs. Take them out.';
-  return undefined;
-}
-
 // end_turn's input, checked. Undefined when it isn't usable, so the turn
 // falls back to the text.
 export function needsFromTool(input: unknown): Needs | undefined {
@@ -102,7 +89,6 @@ export function needsFromTool(input: unknown): Needs | undefined {
     }
     const links = linksFrom(r.links);
     if (links.length) ask.links = links;
-    if (typeof r.run === 'string' && !runCommandProblem(r.run)) ask.run = { command: r.run.replace(/\s+$/, '') };
     asks.push(ask);
     if (asks.length === MAX_ASKS) break;
   }
@@ -467,8 +453,14 @@ const NEXT_ROW =
   'No names from the code or your working (a class, a file, a tool, a nickname for something); describe what it does instead. ' +
   '8 to 15 words: "Stop the Threadbear transcript jumping when a long reply arrives", not "Fix the ScrollAnchor drift". ';
 
+// A queued remote job is still owned by this CLI. A saved continuation
+// preserves the next message, not the process (thread 879afc1e, 14 Nov).
+const END_TURN_BACKGROUND =
+  'Archiving or hibernating stops this CLI\'s background jobs, including shell jobs waiting in a queue. Leave archive, snooze and waitFor out while they run; use schedule_message to check later. ';
+
 // Hibernating itself, in every form's description (snoozeFromTool).
 const END_TURN_SNOOZE =
+  END_TURN_BACKGROUND +
   'snooze hibernates this thread once the turn is over, with needs "nothing" only, until a time ("2h", "1d", "tomorrow", an ISO time with its offset, "restart", or "release" for a new release) or words saying when ("when the phone arrives"). Use it when the user asks for this thread to be snoozed or hibernated, or when the rest waits on a message (one wakes it), until it should have come; it only brings the thread back, so a step of your own later is a schedule_message, except words for something to happen ("until X ships"), which wake you with a turn to check. waitFor names threads it waits on, which wake it when they finish. ';
 
 // Handing a step over, in every form's description. This used to say to offer
@@ -625,6 +617,7 @@ const ONE_REPLY_REPLY =
 // them twice (runner/context-budget.json). Checked in the end_turn eval
 // (~/dev/me/misc/end-turn-eval/v3, "trim") before landing.
 const ONE_REPLY_FIELDS =
+  END_TURN_BACKGROUND +
   TRY_IT_FIRST +
   ONLY_THEY_CAN_TRY +
   'next is only for when nothing is needed: up to 3 follow-ups that really came up and that you\'d tell the user are worth doing; usually none, and never something you\'d call optional or low priority. ' +

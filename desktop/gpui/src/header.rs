@@ -38,7 +38,7 @@ macro_rules! tipped {
     ($el:expr, $tip:expr, $role:expr $(,)?) => {{
         let tip_text: SharedString = $tip.into();
         let shown = tip_text.clone();
-        crate::tips::Tip::tip($el.test_support().role($role).aria_label(tip_text), shown)
+        crate::tips::Tip::tip(crate::a11y::A11yRole::a11y_role($el.test_support(), $role).aria_label(tip_text), shown)
     }};
 }
 
@@ -155,7 +155,7 @@ impl Threadbear {
                 }
             }))
             // Fades over to a new name, as the agent names a new thread (open_motion.rs).
-            .child(crate::open_motion::title(&format!("header-{}", thread.id), title, cx.reduce_motion()))
+            .child(crate::open_motion::title(&thread.id, "header", title, cx.reduce_motion()))
             .into_any_element()
         };
         let worktree = thread.worktree.as_ref().and_then(|w| w["branch"].as_str()).map(String::from);
@@ -293,7 +293,7 @@ impl Threadbear {
         }
         let field = cx.new(|cx| InputState::new(window, cx).placeholder("Thread title").default_value(title));
         // A new name typed and not yet taken: an update's restart waits for it.
-        crate::unsent::watch(&field, cx);
+        crate::unsent::watch(&field, "a thread's new title", cx);
         // The whole name selected, so typing replaces it, as a click on the
         // Swift app's title does (Mike, 11 Nov).
         field.update(cx, |s, cx| s.select_all(window, cx));
@@ -470,7 +470,7 @@ impl Threadbear {
                 match res {
                     Ok(v) => {
                         if let Ok(t) = serde_json::from_value::<ThreadSummary>(v["thread"].clone()) {
-                            this.threads.insert(t.id.clone(), t);
+                            this.threads.insert(t.id.clone(), std::sync::Arc::new(t));
                         }
                     }
                     Err(e) => this.show_error(e.message, cx),
@@ -835,10 +835,10 @@ impl Threadbear {
     }
 
     /// The same over a new list of every thread, against the one before it.
-    pub(crate) fn note_failed_accounts(&mut self, before: &std::collections::HashMap<String, ThreadSummary>) {
-        let now: Vec<ThreadSummary> = self.threads.values().cloned().collect();
+    pub(crate) fn note_failed_accounts(&mut self, before: &std::collections::HashMap<String, std::sync::Arc<ThreadSummary>>) {
+        let now: Vec<ThreadSummary> = self.threads.values().map(|t| &**t).cloned().collect();
         for t in &now {
-            self.note_failed_account(before.get(&t.id), t);
+            self.note_failed_account(before.get(&t.id).map(|t| &**t), t);
         }
         let known: std::collections::HashSet<String> = self.threads.keys().cloned().collect();
         self.failed_on_account.retain(|id, _| known.contains(id));
@@ -1160,11 +1160,13 @@ impl Threadbear {
         self.continuing_refusal = Some(thread.clone());
         cx.notify();
         let client = self.client.clone();
+        // The runner it's shown on, as every send says it (thread.rs, Daybreak 113).
+        let runner_id = self.threads.get(&thread).and_then(|t| t.runner_id.clone());
         let params = json!({ "threadId": thread, "accountId": account, "model": REFUSAL_MODEL });
         cx.spawn(async move |this, cx| {
             let moved = call(client.clone(), "threads.update", params).await;
             let sent = match &moved {
-                Ok(v) if v["thread"]["provider"] == "codex" => call(client, "threads.send", json!({ "threadId": thread, "text": REFUSAL_CONTINUATION })).await.map(|_| ()),
+                Ok(v) if v["thread"]["provider"] == "codex" => call(client, "threads.send", json!({ "threadId": thread, "text": REFUSAL_CONTINUATION, "runnerId": runner_id })).await.map(|_| ()),
                 Ok(_) => Err(threadbear_client::runner::RpcError { code: -1, message: "Codex Sol is no longer available. Choose a model to carry on.".into(), data: None }),
                 Err(e) => Err(e.clone()),
             };
@@ -1283,7 +1285,7 @@ impl Threadbear {
                         }
                         if let Ok(t) = serde_json::from_value::<ThreadSummary>(v["thread"].clone()) {
                             let id = t.id.clone();
-                            this.threads.insert(t.id.clone(), t);
+                            this.threads.insert(t.id.clone(), std::sync::Arc::new(t));
                             this.open(id, window, cx);
                         }
                     }

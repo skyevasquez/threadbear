@@ -49,13 +49,16 @@ echo "$host $cmd" >>"$FAKE/ssh.log"
 [ -d "$d" ] || exit 255
 # The watch's ping: fails once the host's "dead" file is there.
 if [ "$cmd" = true ]; then [ -f "$d/dead" ] && exit 255; exit 0; fi
+# The last check's fresh connection: the same, with a marker, and a host's
+# "login-124" file has its shell exit 124 after printing it.
+if [ "$cmd" = "echo tb-answers" ]; then [ -f "$d/dead" ] && exit 255; echo tb-answers; [ ! -f "$d/login-124" ] || exit 124; exit 0; fi
 run_copy() {
   # A host's "hang" file: it stops answering as the check starts.
   if [ -f "$d/hang" ]; then : >"$d/dead"; sleep 300; exit 0; fi
   # "stubborn": the same, but the hung check ignores SIGTERM.
   if [ -f "$d/stubborn" ]; then : >"$d/dead"; trap '' TERM; sleep 300; exit 0; fi
   # A host's "drop" file: the connection goes during the check (ssh's 255).
-  [ ! -f "$d/drop" ] || exit 255
+  [ ! -f "$d/drop" ] || { [ ! -f "$d/drop-dead" ] || : >"$d/dead"; exit 255; }
   script="$(printf '%s' "$cmd" | grep -oE "$d/home/[^ \\\\']*/scripts/check-remote.sh" | head -1)"
   if [ -n "$script" ] && [ -f "$script" ] && [ -f "$(dirname "$script")/../.check-changed" ]; then
     # A host's "slow" file: the check takes that many seconds, its copy moved
@@ -107,6 +110,9 @@ case "$cmd" in
   *"uname -s"*)
     # A host's "probe-fails" file: it answers, but the probe's mkdir fails.
     [ ! -f "$d/probe-fails" ] || exit 1
+    # "probe-255": the probe's connection fails as ssh's own 255, though a
+    # fresh one (the ping) still gets in.
+    [ ! -f "$d/probe-255" ] || exit 255
     # A host's "base" file says what folder it reports, if not its own.
     b="$d/home/.cache/threadbear-check"; [ -f "$d/base" ] && b="$(cat "$d/base")"
     # A host's "free-after" file: busy for that many more probes, then free.
@@ -156,7 +162,7 @@ export const GiB = 1024 * 1024;
 
 // df: what the host's df prints (plenty free, if not given). dfAfter: what it
 // prints once a copy or a run has failed there. os: Linux, if not a Mac.
-type Host = { state: string; lose?: number; looksFree?: boolean; base?: string; df?: string; dfAfter?: string; os?: string; hang?: boolean; hangCopy?: boolean; drop?: boolean; stubborn?: boolean; queue?: number; loseAck?: boolean; freeAfter?: number; slow?: number };
+type Host = { state: string; lose?: number; looksFree?: boolean; base?: string; df?: string; dfAfter?: string; os?: string; hang?: boolean; hangCopy?: boolean; drop?: boolean; dropDead?: boolean; stubborn?: boolean; queue?: number; loseAck?: boolean; freeAfter?: number; slow?: number };
 export function setup(hosts: Record<string, Host>, opts: { home?: string } = {}) {
   const tmp = tmpDir('check-remote-');
   const home = opts.home ?? shortHome();
@@ -180,6 +186,7 @@ export function setup(hosts: Record<string, Host>, opts: { home?: string } = {})
     if (s.hang) fs.writeFileSync(path.join(fake, h, 'hang'), '');
     if (s.stubborn) fs.writeFileSync(path.join(fake, h, 'stubborn'), '');
     if (s.drop) fs.writeFileSync(path.join(fake, h, 'drop'), '');
+    if (s.dropDead) fs.writeFileSync(path.join(fake, h, 'drop-dead'), '');
     if (s.queue !== undefined) fs.writeFileSync(path.join(fake, h, 'queue'), String(s.queue));
     if (s.freeAfter !== undefined) fs.writeFileSync(path.join(fake, h, 'free-after'), String(s.freeAfter));
     if (s.loseAck) fs.writeFileSync(path.join(fake, h, 'lose-ack'), '');
@@ -210,6 +217,8 @@ export function setup(hosts: Record<string, Host>, opts: { home?: string } = {})
     run(hostList: string, staySecs: number, peek = '', env: Record<string, string> = {}) {
       const base: NodeJS.ProcessEnv = { ...process.env };
       delete base.XDG_CACHE_HOME;
+      delete base.THREADBEAR_CHECK_PREFER;
+      delete base.THREADBEAR_CHECK_GROUP;
       const r = spawnSync('bash', [path.join(repo, 'scripts', 'check-remote.sh'), hostList, '--quick'], {
         encoding: 'utf8',
         env: { ...base, HOME: home, TMPDIR: tmpdir, PATH: `${bin}:${process.env.PATH}`, FAKE: fake, PEEK: peek, THREADBEAR_CHECK_STAY_SECS: String(staySecs), ...env },

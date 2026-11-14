@@ -193,7 +193,7 @@ It comes from reading code, not from running anything, so "(unverified)" means n
 | `rich.inline` | Inline Markdown | Bold, italic, strike, inline code pills, bare URLs | `TextView` (unverified that its inline code can match our pill). | kit | M | `MarkdownRenderer`, `TextKit` |
 | `rich.blocks` | Headings, lists, quotes | Block styles and list markers | `TextView`, styled through the theme. | kit | M | `MarkdownRenderer` |
 | `rich.codebox` | Code boxes | Rounded box behind code | `TextView` code blocks, with long ones capped and scrolled inside as Ghostex does. | kit | S | `MarkdownRenderer`, `TextKit` |
-| `rich.table` | Tables | Natural widths, scales down to fit | Our own table block, as `TextView` isn't known to do natural widths that scale down (unverified). | build | M | `MarkdownRenderer` (`renderTable`) |
+| `rich.table` | Tables | Natural widths, scales down to fit | TextView with our opt-in natural-width style; wide tables still fit or scroll inside the column. | kit | M | `MarkdownRenderer` (`renderTable`) |
 | `rich.localpicture` | Local pictures | `![](/path)` drawn in the flow, blocked for other Macs' threads | Our own image block, keeping the block for other runners' threads. | build | M | `MarkdownRenderer` (`picture`), `ImageLayout` |
 | `rich.mermaid` | Mermaid diagrams | Drawn with Pele in the app's colours, disk cached | Run `pele.js` in the web runtime and cache the picture on disk, showing the source when the runtime isn't installed; offscreen capture from CEF is (unverified). | web | L | `RichBlocks`, `RichRenderer`, `pele.js` |
 | `rich.html` | HTML blocks | Static page, no scripts or network | Web runtime page with the same lockdown as `file.htmlpreview`, showing the source when the runtime isn't installed. | web | M | `RichRenderer`, `PreviewSandbox` |
@@ -337,7 +337,7 @@ It comes from reading code, not from running anything, so "(unverified)" means n
 | ID | Feature | What it does | How in GPUI | Route | Size | Swift |
 |---|---|---|---|---|---|---|
 | `terminal.panel` | Terminal panel | Full emulator, per-thread shell, ⌘J, New Shell | `alacritty_terminal` drawn as our own GPUI element, as Ghostex does with libghostty-vt. | build | L | `TerminalPanel` |
-| `cards.run` | Run on the card | An ask with a command shows it whole with Run, which runs once on the thread's machine and tells the agent | Drawn on the card, pressed through the button RPC. | build | S | `RowRenderer` (`appendRun`), `AppModel+ThreadActions` (`pressRunButton`) |
+| `cards.run` | Run on the card | Taken out 14 Nov 2026: the runAsks experiment was turned off and removed | Not ported: the Swift app's is frozen and the runner no longer offers it. | drop | none | `RowRenderer` (`appendRun`), `AppModel+ThreadActions` (`pressRunButton`) |
 | `terminal.putcommand` | Put a command in the Terminal | Play icon on a shell block types it at the prompt, never presses Return, replaces its own unrun command, copies instead if the shell is busy | Icons on the code block, then the terminal's own paste. | build | S | `ShellBlockIcons`, `ShellBlock`, `TerminalPanel` (`Terminals.put`) |
 | `terminal.lifecycle` | Shell lifecycle | Starts on request, stops on archive or quit | Unix pty on macOS and Linux, ConPTY on Windows. | shim | M | `TerminalPanel` (`Terminals`) |
 
@@ -436,7 +436,7 @@ It comes from reading code, not from running anything, so "(unverified)" means n
 | `system.badge` | Dock badge | Count | GPUI has no badge API, so macOS needs `dockTile` code, Windows a taskbar overlay (unverified), and Linux has no equivalent we know of. | shim | S | `AppModel+Chrome` |
 | `system.startrunner` | Start runner | launchctl kickstart | launchd on macOS, systemd on Linux, a Windows service on Windows. | shim | M | `Support` (`RunnerLauncher`) |
 | `system.selfupdate` | Self-update | Builds from main, stages, swaps | Per-OS swap on macOS, Windows and Linux; Windows can't overwrite a running `.exe` and needs a toolchain to build from source. | shim | L | `AppUpdate` |
-| `system.handover` | Seamless handover | New build under the old window, no flicker | Risk: it needs window ordering, alpha and a takeover signal that GPUI doesn't expose, and GPUI's `restart()` is only wait-then-reopen. | hard | L | `Handover` |
+| `system.handover` | Seamless handover | New build under the old window, no flicker | `handover.rs`: a second copy started with `open -n`, its NSWindow at alpha 0 under the old one until it's loaded, files in a folder named for the old pid for ready/go/done. Mac only; elsewhere the window goes and comes back. | hard | L | `Handover` |
 | `system.crash` | Crash reporting | Sentry from installed release | sentry-rust (inferred), installed releases only and no user text. | build | S | `CrashReporting` |
 | `system.hangwatch` | Hang watch | Samples the stuck main thread | Watchdog thread is ours, but sampling is per OS (`sample` is macOS only), and GPUI's `profiler/hang.rs` gives tasks rather than stacks. | shim | M | `HangWatch`, `HangSample` |
 | `system.applog` | App log | The connection coming and going, failed requests, notices and scripted commands, for an agent to read | A file: the installed app's `~/Library/Logs/Threadbear/desktop.log`, a scripted app's beside its automation file. | build | S | `AppLog` |

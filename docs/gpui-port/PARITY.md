@@ -37,9 +37,9 @@ earlier four-platform run.
 
 <!-- parity:start -->
 
-126 of 329 features have a spec so far, across 226 scenarios.
+125 of 329 features have a spec so far, across 225 scenarios.
 
-Scenarios passing: Swift: 207 of 226, Mac: 214 of 226, Windows: 192 of 226, Linux: 214 of 226.
+Scenarios passing: Swift: 207 of 225, Mac: 214 of 225, Windows: 192 of 225, Linux: 214 of 225.
 
 
 ### 0. Foundations everything else needs
@@ -216,7 +216,6 @@ Scenarios passing: Swift: 207 of 226, Mac: 214 of 226, Windows: 192 of 226, Linu
 | Feature | Swift | Mac | Windows | Linux |
 |---|---|---|---|---|
 | `terminal.panel` Terminal panel | pending | pending | pending | pending |
-| `cards.run` Run on the card | pending | pending | pending | pending |
 | `terminal.putcommand` Put a command in the Terminal | pending | pending | pending | pending |
 
 ### 14. Projects, Librarian, Schedules, Usage, Runners, Connectors, Updates
@@ -261,6 +260,58 @@ One entry a slice, newest first. Every entry has a `Verification:` line: a spec
 run or a screenshot from the running app. A slice with no runtime check doesn't
 count. (Ghostex's port log is where this shape comes from; its slices 214 to 268
 built parsers and gates with no launch of the app, which is the trap.)
+
+### 2026-11-13 Restarting onto the next version hands over, and threads keep their place (`system.handover`, `system.selfupdate`)
+
+- The GPUI app's restart onto a staged build was the window going and coming
+  back, and every thread opened at its end afterwards: scroll places were
+  only kept in memory. With the window plainly on screen it now hands over
+  as the Swift app's Handover.swift does: the staged bundle is swapped in,
+  started as a second copy (`open -n -g` with `--handover-from`, `-below`,
+  `-frame`), which opens its window unseen (alpha 0, no clicks) in the old
+  window's frame and just under it, loads the list and the open thread, then
+  shows itself there and says ready. The old app hands over the keys if it
+  had them, writes its drafts, says go with where it is now, and quits once
+  the new one says done (or a second later). The two talk through three
+  small files in `$TMPDIR/threadbear-handover-<old pid>`, not distributed
+  notifications. No ready in 20 s: the old app quits for a new one that's
+  still running, or restarts the old way if it isn't. The old app gone
+  without a go: the new one takes over anyway. The incoming app leaves
+  notifications and following main to the one showing until it takes over,
+  and doesn't swap at launch (the old app is running from the bundle that
+  would clear). Minimised, full screen, hidden, and Windows and Linux
+  restart as before.
+- What a restart saves now has every thread's scroll anchor that isn't at
+  its end, the open panes measured as it starts (up to 200 threads), and
+  puts them in the pane's memory before any thread opens. The Swift app
+  keeps only the open thread's.
+- Every guard the restart had still holds it: the rules and their
+  `restart_hold` wording are unchanged.
+- Files: `desktop/core/src/handover.rs` (the pure parts, with tests),
+  `desktop/gpui/src/handover.rs`, `app_update.rs`, `rows.rs`, `main.rs`,
+  `app.rs`, `drafts.rs`, `notify.rs`, `thread.rs`, `updates_panel.rs`
+  (`updates` with `restartState`, and `fresh` on `restore`),
+  `features/updates.feature`, `docs/guide.md`, `docs/on-your-mac.md`.
+- Verification: core's handover tests and the scroll memory test on Tinker
+  Desk. The new scenario (a thread scrolled up comes back where it was)
+  passes there and fails with the recall taken out. A release bundle
+  installed in a throwaway place on Tinker Desk's screen, with a staged
+  next build and the mock runner, restarted by itself after five idle
+  seconds: the new copy was ready 0.32 s after it loaded, took over in
+  front, and the old one quit; a recording at 10 frames a second shows the
+  window in place on every frame. The one visible change was that run's
+  first-run tour card fading in again, as its throwaway data folder had
+  never finished the tour.
+- Codex (gpt-6.1-sol) tried to break it twice. What held up is fixed:
+  drafts and settings stay the old app's until the new one takes over,
+  the go waits for anything a restart by itself would have waited for
+  (a shell, a menu, a picture still coming in) that started while the new
+  copy loaded, the old window stops taking clicks as it says go, a new copy
+  that dies after ready or before done gets the old way's restart, and the
+  places carried in the go replace any the new copy was still paging to.
+  Left as it is: a setting changed in the old window during the second or
+  two of loading is in the new app's file but not on screen until it's
+  next opened. The restart ran again after each round, the same way.
 
 ### 2026-11-13 A project's page in tabs, with Go's Show Previous and Next Tab (`projects.tabs`)
 
@@ -1120,8 +1171,10 @@ Fixes from Codex's review of the slice before:
   carry `@windows-pending @linux-pending`, which `cucumber.mjs` and
   `parity.mjs` now understand. The Swift dump gives a video's size too, and
   both apps take `preview` `play`.
-- Next: a video from another Mac (the Swift app fetches a copy), pages in the
-  review window and the pane (`file.htmlpreview`).
+- Another Mac’s files stay there over Convex in both apps today
+  (`RemoteFiles.swift`); the older direct-link video-copy note no longer
+  describes that route. GPUI’s direct runner connections remain unported.
+  Local pages in the review window and pane are now ported (`file.htmlpreview`).
 - Files: `desktop/gpui/native/media_views.m`, `desktop/gpui/build.rs`,
   `desktop/gpui/src/media_view.rs`, `desktop/gpui/src/open_gate.rs`,
   `desktop/gpui/src/files.rs`, `desktop/gpui/src/shell.rs`,
@@ -3715,6 +3768,14 @@ Fixes from Codex's review of the slice before:
 - Verification: the scenarios for each (`@sidebar.sections`, `@reply-buttons`,
   `@composer.textbox`, `@menu.app`, `@card.needsyou`) on Tinker Desk, as each
   slice landed.
+### 2026-11-14 Run on the card taken out (`cards.run`)
+
+- Mike turned the `runAsks` experiment off on 10 Nov and asked on 14 Nov for
+  it to go: the play icon on a reply's shell block (`terminal.putcommand`)
+  is what he wanted. `card_run.rs` (core and app), `Ask.run`, the
+  `cardRuns` dump and its scenario are gone; an ask that still carries
+  `run` from an older runner decodes as before, without it.
+
 ### 2026-11-11 Run on the card (`cards.run`)
 
 - An ask that carries a command (`end_turn`'s `run`, behind the runner's
@@ -4898,3 +4959,43 @@ Fixes from Codex's review of the slice before:
   scrolling, ambiguous thread ids and the composer restore/focus paths.
   After rebasing onto current main, the board and ordinary page-navigation
   checks passed together: 11 scenarios and 103 steps on Tinker Desk.
+
+### 2026-11-13 A pane row opens only its own menu (`highlights.rowmenus`)
+
+- Right-clicking a pin, file, link or schedule opened its row menu and the
+  enclosing dock panel's menu. The shared row handler now stops that press
+  before the dock handles it. Board cards already do the same.
+- The regression right-clicks the rendered rows and reads every drawn
+  popup menu. Before the fix, a pinned file opened both menus; afterwards
+  it opens one, with its file actions and Remove. All five row-menu
+  scenarios pass, with 39 steps, on the Linux scripted app.
+
+### 2026-11-13 Short tables fit their words and lists have room (`rich.table`, `rich.blocks`)
+
+- Reply tables stop at their measured content width, with wide tables
+  fitting or scrolling inside the available column. List items have the
+  Swift renderer's six-point gap, following the app's zoom.
+- The vendored text style opts in from the app; its defaults are preserved
+  for other text views. Painted-layout tests check a short table at wide,
+  medium and narrow parent widths, the old stretching default, and the
+  difference between list-item gaps.
+- Mac window pictures of wide and narrow replies were inspected alongside
+  the Swift renderer. Cross-lab review found nothing significant.
+- Verification: the two painted-layout tests pass on the Mac, and the two
+  scripted GPUI scenarios pass on cloud (18 steps), measuring painted cells
+  and list lines rather than matching style settings.
+
+### 2026-11-13 PDF and film pictures on link cards (`rich.linkpeek`)
+
+- Local Mac PDF/video links show a bounded first-page/frame raster, shared
+  by reply links and Needs you link buttons. Decode failures keep the file symbol.
+- Pane documents and PDF hovers share one Quick Look job and private descriptor
+  snapshot helper. The pane keeps its 256 MB/1600×1200 limits; hover uses
+  16 MB/552×340 and at most 2 MB of PNG output. Only hover requests time out after five seconds; pane previews keep waiting until completion or view removal.
+- A full file-version stamp joins the asset key to the gate’s checked descriptor.
+  Video decoders forbid external references and retain their descriptor through
+  a late callback. Quick Look retains only its private snapshot until cancellation
+  completes. Other Mac paths are refused before reading local metadata; other
+  systems keep the file symbol.
+- Native regression tests synthesize their own film and PDF, including path
+  replacement, size/output caps, version mismatch and delayed callbacks.

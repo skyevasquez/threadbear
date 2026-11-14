@@ -244,9 +244,14 @@ the box at the bottom, and Send takes it all back to the thread.
 Pasting with the keyboard outside the reply box puts the words in it and moves
 the cursor there, so you can dictate just after ticking an option.
 
+Short tables in replies stay as wide as their words need. Wide tables fit or
+scroll inside the reply, and list items have space between their lines.
+
 Inside a thread, rest the pointer on a link for a moment, in a reply or on a
 Needs you card's buttons, to see where it goes: a picture of the file, or
-the page's address. Click it to open it (the middle mouse button works
+the page's address. On a Mac a local PDF shows its first page and a video
+its first frame. A PDF over 16 MB or a file that can't be previewed keeps
+its file symbol. Click it to open it (the middle mouse button works
 too). If an agent already has that page
 open in Chrome through [BrowserBear](https://github.com/mikecann/browserbear)
 (say, a sign-in page it wants you to use), the click brings the agent's tab
@@ -512,6 +517,12 @@ left still archives it; any other way drags the thread. The agent gets a `thread
 read the thread from, and clicking the chip once it's sent opens that
 thread. An id that isn't one of your threads pastes as plain text.
 Stop (⌘.) ends a turn that's running.
+If you stop before the agent starts reading your message, Threadbear saves
+it and its pictures and leaves a note under that turn's Worked for line.
+They go with your next message, including after you switch models or restart
+Threadbear. Stop on its own doesn't retry them. Clearing the conversation
+discards them. Moving the thread to another runner keeps the original messages
+in its history, but you need to send the stopped request again there.
 
 On a Mac the composer checks your spelling as the Mac's own text boxes do. A
 misspelled word gets a red wavy line once you've finished typing it, and
@@ -660,7 +671,11 @@ you start takes the place of the new-thread screen, so Back from it goes to
 wherever you were before you pressed New thread.
 
 Hibernating or archiving a thread that's partway through a turn stops
-that turn. From the row's hover buttons, Threadbear asks first.
+that turn. It also stops any background jobs that thread's agent left running,
+including shell jobs waiting their turn in a queue. From the row's hover buttons,
+Threadbear asks first. A scheduled message can bring the agent back later,
+but it does not keep those jobs alive. To let a job finish, leave its thread
+awake; the agent can end its reply while the job carries on.
 
 You can also ask a thread to do it to itself ("hibernate this until
 Thursday", "archive this when you're done"). It finishes its reply first,
@@ -985,6 +1000,11 @@ runs. If the run ends with nothing for you, the thread goes back into the
 archive, so a watcher you've put away only lands in your inbox when it has
 something you need to act on.
 
+If an update leaves a thread on the old runner while a command finishes,
+its scheduled messages can still start turns there. An old runner from before
+this feature was added may have to finish moving the thread before its next
+scheduled message arrives.
+
 A schedule can have a check: a shell command that runs first, in its
 folder, each time it's due. If the check prints nothing, that run is
 skipped and no agent starts, so a schedule that looks for new Sentry
@@ -994,6 +1014,8 @@ run goes ahead with the error, so you hear about it. A check has a minute
 to finish, or up to five if its schedule says so, for one that reads
 something slow like Slack. What a check prints is kept until a run
 carrying it has been sent, so a runner restart in between doesn't lose it.
+A runner update keeps the check in its thread's folder; during handover,
+it waits until that folder is known.
 Ask a thread to "only run when there's something new" and it writes the
 check. Run now skips it. It's bound to what it runs: if a script it
 reaches changes, or you move the schedule to another folder, it doesn't
@@ -1091,8 +1113,9 @@ from your phone meanwhile goes with it. It goes straight away, to the
 folder and login that machine guesses. If it can't go, or something won't
 come (background jobs, changes in a checkout other threads share), a small
 window shows the folder and login with why; change either and it checks
-again, then press **Move**. The row says "Moving to" with a spinner until
-it's gone, then the thread is listed under the other machine, in the same
+again, then press **Move**. The row says "Moving to" with a spinner, and the
+message box stays locked, until the other machine has it (a moment after it
+leaves the first), then the thread is listed under the other machine, in the same
 place and still open, and its next message carries on in the same Claude
 session there. If anything goes wrong before it lands, it stays where it
 was and the row says why for a minute, in its tooltip. Its schedules come
@@ -1623,7 +1646,7 @@ for one Mac's ordinary use.
 
 If you'd rather keep everything on your own machine, setup can run
 Convex's open source backend in Docker on your Mac instead, and reach it
-over Tailscale. It's the same backend and the same features, with these
+over Tailscale (or your own way, below). It's the same backend and the same features, with these
 limits:
 
 - **No phone notifications.** The push relay only works with Convex
@@ -1688,6 +1711,31 @@ The dashboard is at `http://127.0.0.1:16791`, with the same admin key.
 Running setup again keeps it local. If you get Tailscale later and want
 the phone, run `./threadbear setup --self-hosted --tailnet`: it moves the
 backend onto your tailnet and your threads stay. `--local` moves it back.
+
+### At your own address
+
+If your phone already reaches your Mac your own way (Caddy, nginx,
+cloudflared, your own Tailscale or a VPN), give setup the two https
+addresses your proxy answers on, and Threadbear leaves the rest to you:
+
+```sh
+./threadbear setup --self-hosted --yes \
+  --url https://threadbear.example.com \
+  --site-url https://threadbear-site.example.com
+```
+
+The backend stays on this Mac's `127.0.0.1`, and your proxy points `--url`
+at `127.0.0.1:13210` and `--site-url` at `127.0.0.1:13211` (your website
+and share links). Setup checks both work, from this Mac and from inside
+Docker, before it carries on, and says which one didn't. Then pair your
+phone from Settings › Phone & browser as usual. That needs iPhone 1.0.5 or
+later.
+
+The limits are the tailnet way's, except that Tailscale isn't needed:
+**no phone notifications**, **nothing works while your Mac sleeps**, Docker
+is stopped or your proxy is down, and share links open for **whoever can
+reach your address**. `--local` or `--tailnet` move it off your address,
+and your threads stay.
 
 ## Patches: your own buttons and panels
 <!-- slug: patches -->
@@ -1902,13 +1950,23 @@ minute): straight away while you're in another app, and with it in front
 once you haven't touched the Mac for five seconds. "Typed" is any box: a
 message, a card's own answer, a project's goals being edited, a picture
 still coming in. It opens again on the list and the thread you had, behind
-the app you're in if that's where you were. It has no handover yet, so its
-window goes for a moment and comes back.
+the app you're in if that's where you were, with every thread you'd
+scrolled up in where you left it rather than at its end. On a Mac its
+window stays where it is: the new version opens the same thread underneath
+and takes over, as the Swift app's does.
 
 The Updates icon on the left-hand rail shows what's on its way for the app,
 the runner and the Claude Code and Codex tools. A grey dot means something
 is in progress and will sort itself out, and a coloured dot means it needs
 you. Right-click it for a quick Restart to Update.
+
+A few parts of the runner (the program that keeps it going, and the small
+Threadbear Runner app macOS names in its privacy prompts) don't come with
+its updates, only with reinstalling it. When one of them is behind, the
+Updates panel says which and has a Reinstall now button. Reinstalling
+restarts the runner, so it waits until no thread is busy, then runs on its
+own and is back in a minute or so. If the new runner doesn't come up, the
+old one is put back and the panel says why, with Try again and the log.
 
 ### Mike's updates
 
@@ -2052,7 +2110,7 @@ your phone, the website and your other machines can show each tool's output and
 diffs too, even when your Mac's asleep: its output, its input and diffs go up, after
 the same scrubbing, and are kept 30 days; output from files and commands that
 usually hold secrets stays on your Mac, and so do tool screenshots. Threadbear asks
-once, when you pair a phone or add a machine; Send tool output to Convex in Settings
+once, when you pair a phone or add a machine, and your pick on that card sets it; Send tool output to Convex in Settings
 (⌘,) > General > Full sync, or `tb settings full on|off`, sets it any time, from the
 runner's next start. `tb status` estimates how much of Convex's Free plan you're using and
 warns before you get near its limits. Pictures you paste into
