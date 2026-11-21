@@ -1,4 +1,4 @@
-// Pools: picking a login for a thread, noticing one at its limit, waiting for room and moving the thread to another login (docs/protocol.md, "Pools").
+// Pools: picking a login for a thread, noticing one at its limit, waiting for room and moving the thread to another login (docs/protocol/settings.md, "Pools").
 // Part of the Runner (runner.ts), split out on 4 Nov 2026 as a plain move so a
 // fork's change to one area doesn't clash with another's. Each method's `this`
 // is the Runner; runner.ts puts them on its prototype.
@@ -12,7 +12,7 @@ import { DEFAULT_POOL_FOLDERS, peekRunnerJson, readRunnerJson, writeRunnerJson }
 import { UNKNOWN_WAIT_MS, WAIT_SLACK_MS, backAt, blockedUntil, limitWhy, loginOk, nextLogin, pickInPool, poolAccounts, poolForFolder, poolProviders, readPools, roomWait, validatePools } from '../pools.ts';
 import { historyItems, selectHistory } from '../handoff-history.ts';
 import type { ThreadState } from '../runner.ts';
-import { CARRY_ON_BACK, CARRY_ON_MOVED, isClaudeModel, modelRow, modelTitle } from '../runner.ts';
+import { CARRY_ON_BACK, CARRY_ON_MOVED, CARRY_ON_SIGNED_OUT, isClaudeModel, modelRow, modelTitle } from '../runner.ts';
 import { providerName } from '../providers.ts';
 
 export const poolsPart = {
@@ -136,7 +136,7 @@ export const poolsPart = {
   // first) with the most room, else one of another provider with room,
   // else the first of its provider. undefined when no pool has a login
   // this runner can use.
-  pickForNew(this: Runner, p: { poolId?: string; cwd: string; model?: string }): { poolId: string; accountId: string } | undefined {
+  pickForNew(this: Runner, p: { poolId?: string; cwd: string; model?: string; provider?: Provider }): { poolId: string; accountId: string } | undefined {
     const accounts = this.usableAccounts();
     const pools = this.pools().filter((x) => poolAccounts(x, accounts).length);
     let pool: Pool | undefined;
@@ -144,7 +144,9 @@ export const poolsPart = {
       pool = pools.find((x) => x.id === p.poolId);
       if (!pool) throw new RpcError(ErrorCode.badParams, `No pool called ${p.poolId}. Pools: ${pools.map((x) => x.id).join(', ') || 'none'}`);
     }
-    const wanted = p.model ? this.modelProvider(p.model) : undefined;
+    // The provider the picker's pick was under, when it says: a model id
+    // can be claimed by several (OpenCode lists gpt-… ids too).
+    const wanted = (p.poolId !== undefined ? p.provider : undefined) ?? (p.model ? this.modelProvider(p.model) : undefined);
     if (!pool) {
       pool = poolForFolder(pools, p.cwd) ?? pools.find((x) => x.id === this.defaultPoolId(pools, accounts)) ?? pools[0];
       if (!pool) return undefined;
@@ -203,6 +205,30 @@ export const poolsPart = {
     this.carryOn(st, CARRY_ON_MOVED);
   },
 
+  // A turn ended failed with its Claude login refused (errorKind auth). The
+  // login already counts as signed out (SignInState.noteRefused). A pool thread
+  // moves to the next login with room and carries on; with none, or pinned
+  // to that login, it stays put with the sign-in banner naming the login,
+  // as only Mike can sign it in (claude.ai's captcha). Signing back in
+  // makes it a new sign-in, which takes the refusal back.
+  onSignedOut(this: Runner, st: ThreadState): void {
+    const { rec } = st;
+    const pool = this.poolById(rec.poolId);
+    if (!pool || this.bucket(rec) !== 'inbox' || rec.queue.length) return;
+    const accounts = this.usableAccounts();
+    const was = accounts.find((a) => a.id === rec.accountId);
+    // Only Claude logins are tracked as signed out (sign-in-state.ts). A
+    // Codex refusal isn't remembered, so moving on it could bounce a thread
+    // between two refused logins for ever (Grok's review, 16 Nov).
+    if (was?.provider !== 'claude') return;
+    // The refusal may not have reached the list (no SignInState: tests, or
+    // a fork's): never move back onto it.
+    const next = nextLogin(pool, accounts.map((a) => (a.id === rec.accountId ? { ...a, signedOut: true } : a)), rec, this.clock.now());
+    if ('waitUntil' in next) return;
+    this.moveLogin(st, accounts.find((a) => a.id === next.accountId)!, `${was?.title ?? rec.accountId} is signed out`);
+    this.carryOn(st, CARRY_ON_SIGNED_OUT);
+  },
+
   // A login a turn found at its limit counts as blocked until its window
   // resets (30 minutes when none says), here and in the UsageStore, which
   // tells clients. The reading may already say so.
@@ -245,7 +271,7 @@ export const poolsPart = {
       note += ` It's on ${providerName(to.provider)} now, with ${model}${rec.sessionUsed ? ' and a summary of the thread so far' : ''}.`;
     }
     if (rt.session) {
-      rt.releaseWhenIdle = true;
+      this.cli(st, { kind: 'leave' });
       if (!rt.turn) this.releaseSession(st);
     }
     rec.updatedAt = this.isoNow();
@@ -261,6 +287,9 @@ export const poolsPart = {
     const { rec } = st;
     const now = this.clock.now();
     const account = this.usableAccounts().find((a) => a.id === rec.accountId);
+    // A lapsed plan has no reset to wait for: the thread stays stopped, and
+    // its limit box lets Mike move it.
+    if (account?.planEnded) return;
     // backAt when the reading says it's out; else (the turn found out
     // first) the tightest window's reset, or UNKNOWN_WAIT_MS.
     const at = account ? (backAt(account, now) ?? blockedUntil(account, now)) : now + UNKNOWN_WAIT_MS;
@@ -363,7 +392,8 @@ export const poolsPart = {
       return;
     }
     try {
-      this.sendTo(st, text, [], { origin: 'runner', queue: true });
+      const wakeReason = text === CARRY_ON_BACK ? 'The login had room again' : text === CARRY_ON_SIGNED_OUT ? 'Moved to another login after a sign-out' : 'Moved to another login';
+      this.sendTo(st, text, [], { origin: 'runner', queue: true, wakeReason });
     } catch (e) {
       this.log.error('could not carry on after a move', { threadId: rec.id, error: String(e) });
     }

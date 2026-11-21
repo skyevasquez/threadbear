@@ -7,6 +7,7 @@ import { go } from './route';
 import { escapeDestinations, findStep, readLink } from './thread-links';
 import { pictureNumber, remarkPictureChips } from './picture-chips';
 import { hostOf, pictureSrc } from './picture-src';
+import { OutLink } from './link-confirm';
 import * as Icon from './icons';
 import { workedTitle, type TurnMessage } from './turns';
 import { diffFiles, inputLines, keptWords, pictureCount } from './tool-body';
@@ -15,7 +16,7 @@ import { useLiveQuery } from './live';
 import type { FunctionReturnType } from 'convex/server';
 import { api } from '../../convex/_generated/api';
 import { useState, type ReactNode } from 'react';
-import { bareLinks, draftFrom, fenceClosed, draftHTML, draftLabel, draftLines, draftPlainText, type Draft, type Span } from './draft';
+import { bareLinks, draftFrom, fenceClosed, draftHTML, draftLabel, draftLines, draftPlainText, editedLabel, type Draft, type Span } from './draft';
 
 // A message or tool line, from phone:messages or share:view.
 export type PageMessage = TurnMessage;
@@ -211,12 +212,16 @@ export function MessageText({
     <div className="md" id={seq === undefined ? undefined : stepId(seq)}>
       <Markdown
         remarkPlugins={pictureChips ? [remarkGfm, remarkPictureChips] : [remarkGfm]}
-        // The default keeps links safe (no javascript: and the like). A
+        // The default keeps pictures' addresses safe. A
         // file:// picture is let through only to be looked up in
         // `pictures`; it's never used as an address itself.
         // work:, thread: and review: are never used as addresses either: the
         // `a` below reads them and makes its own.
-        urlTransform={(url, key) => ((key === 'src' && url.startsWith('file://')) || (key === 'href' && (readLink(url) || pictureNumber(url) !== undefined)) ? url : defaultUrlTransform(url))}
+        // A link's address is left as written for the `a` below, which
+        // reads work:, thread:, review: and picture links itself and hands
+        // every other one to OutLink (link-policy.ts), the one rule for what
+        // a thread's words may link to.
+        urlTransform={(url, key) => ((key === 'src' && url.startsWith('file://')) || key === 'href' ? url : defaultUrlTransform(url))}
         components={{
           // A ```slack, ```email or ```draft fence is a draft to send
           // elsewhere (draft.ts); any other <pre> is drawn as before.
@@ -235,9 +240,9 @@ export function MessageText({
               const url = pasted?.get(picture);
               if (url) {
                 return (
-                  <a className="pasted" href={url} target="_blank" rel="noreferrer" title={`Picture ${picture}, click to open it`}>
+                  <OutLink className="pasted" href={url} title={`Picture ${picture}, click to open it`}>
                     <img src={url} alt={`Picture ${picture}`} loading="lazy" />
-                  </a>
+                  </OutLink>
                 );
               }
               return (
@@ -255,12 +260,16 @@ export function MessageText({
             if (!link && href && !/^[#/]/.test(href) && !/^[a-z][a-z0-9+.-]*:/i.test(href)) {
               return <span title="This file is on the Mac">{children}</span>;
             }
-            if (!link) {
+            // A #… link (a footnote) is a place on this page, followed here.
+            if (!link && href?.startsWith('#') && !/[\s\u0000-\u001f]/.test(href)) {
               return (
-                <a {...p} href={href} target="_blank" rel="noreferrer">
+                <a href={href} title={p.title}>
                   {children}
                 </a>
               );
+            }
+            if (!link) {
+              return href ? <OutLink href={href} title={p.title}>{children}</OutLink> : <>{children}</>;
             }
             if (link.kind === 'step' && seq !== undefined && rows) {
               const step = findStep(link.quote, seq, rows);
@@ -303,15 +312,15 @@ export function MessageText({
             if (picture.kind === 'none') return <span className="muted">[{alt || 'image'}]</span>;
             if (picture.kind === 'link') {
               return (
-                <a href={picture.url} target="_blank" rel="noreferrer" title={`A picture on ${hostOf(picture.url)}, not loaded here. Click to open it.`}>
+                <OutLink href={picture.url} title={`A picture on ${hostOf(picture.url)}, not loaded here. Click to open it.`}>
                   [{alt || 'picture'}]
-                </a>
+                </OutLink>
               );
             }
             return (
-              <a href={picture.url} target="_blank" rel="noreferrer">
+              <OutLink href={picture.url}>
                 <img className="picture" src={picture.url} alt={alt ?? ''} loading="lazy" referrerPolicy="no-referrer" />
-              </a>
+              </OutLink>
             );
           },
         }}
@@ -386,15 +395,32 @@ function DraftSpan({ span }: { span: Span }) {
   if (span.strike) out = <s>{out}</s>;
   if (span.italic) out = <em>{out}</em>;
   if (span.bold) out = <strong>{out}</strong>;
-  // draft.ts only makes http(s) and mailto links.
+  // draft.ts only makes http(s) and mailto links; a mailto asks first.
   if (span.link) {
-    out = (
-      <a href={span.link} target="_blank" rel="noreferrer">
-        {out}
-      </a>
-    );
+    out = <OutLink href={span.link}>{out}</OutLink>;
   }
   return <>{out}</>;
+}
+
+// The drafts Mike changed on the Mac and sent with a message
+// (draft.ts, `splitEdited`): a chip each under his words, opening to the
+// draft he sent, as the Mac's bubble shows them.
+export function EditedDrafts({ drafts }: { drafts: Draft[] }) {
+  if (!drafts.length) return null;
+  return (
+    <div className="edited-drafts">
+      {drafts.map((draft, i) => (
+        <details key={i} className="edited-draft">
+          <summary title="Your version of the agent's draft, sent with this message for it to use">
+            <span aria-hidden="true">{draft.kind === 'email' ? '✉︎' : draft.kind === 'slack' ? '💬' : '📄'}</span> {editedLabel(draft.kind)}
+          </summary>
+          <div className="md">
+            <DraftBox draft={draft} />
+          </div>
+        </details>
+      ))}
+    </div>
+  );
 }
 
 // Pictures that go after a row: an attachment, or what a tool handed back.
@@ -403,9 +429,9 @@ export function Pictures({ items }: { items: Picture[] }) {
   return (
     <div className="pictures">
       {items.map((p) => (
-        <a key={p.url} href={p.url} target="_blank" rel="noreferrer">
+        <OutLink key={p.url} href={p.url}>
           <img className="picture" src={p.url} alt="" loading="lazy" width={p.width} height={p.height} />
-        </a>
+        </OutLink>
       ))}
     </div>
   );

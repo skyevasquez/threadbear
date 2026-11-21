@@ -39,6 +39,15 @@ Feature: The chips under the message box
     When I pick "High" from the "model" menu
     Then the model chip says "Claude · Fable 5.1 · High"
 
+  # A pool with logins of several providers lists each one's models under
+  # its name (the Swift picker's sections). The GPUI picker showed only the
+  # first login's provider until 20 Nov, so OpenCode's Gemini models in
+  # Mike's Main pool were nowhere to be picked.
+  @composer.modelpicker
+  Scenario: A pool of Codex and Claude logins lists both providers' models
+    Then the "model" menu has a row "## Codex"
+    And the "model" menu has a row "## Claude"
+
   # The Login line under the effort levels (Mike's pick, 12 Nov): the Swift
   # app is frozen with its "Pinned to … · Unpin" line, so these are GPUI's.
   @composer.modelpicker @swift-pending
@@ -146,3 +155,24 @@ Feature: The chips under the message box
     And I paste the picture into the composer
     And the composer holds 2 pictures
     Then clicking the thumbnail of picture 1 opens picture 1 of 2
+
+  @composer.chiphover @swift-pending
+  Scenario: Many pictures wrap onto more rows, and the last one can still be opened
+    When the window is 1000 points wide
+    And I paste the picture into the composer 8 times
+    And the composer holds 8 pictures
+    Then clicking the thumbnail of picture 8 opens picture 8 of 8
+
+  # The × over a thumbnail is an edit ⌘Z takes back, and the chip it brings
+  # back has to bring its picture: it came back empty, and the message then
+  # went without the picture (Codex's review of the ⌘Z fix, 18 Nov).
+  @composer.picturechips @swift-pending
+  Scenario: Undoing a picture's × brings the picture back with its chip
+    When I type "Look at this" in the composer
+    And I paste the picture into the composer
+    And the composer holds 1 picture
+    And I remove picture 1 with its ×
+    Then the composer holds 0 pictures
+    When I put the cursor in the composer
+    And I press ⌘Z
+    Then the composer holds 1 picture
